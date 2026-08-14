@@ -61,8 +61,16 @@
 #define HI_VCODEC_VP9 38
 
 #define HISI_DVB_VIDEO_DEVICE "/dev/dvb/adapter0/video0"
+#define HISI_DVB_STREAMTYPE_MPEG2 0
+#define HISI_DVB_STREAMTYPE_H264 1
+#define HISI_DVB_STREAMTYPE_H263 2
+#define HISI_DVB_STREAMTYPE_VC1 3
+#define HISI_DVB_STREAMTYPE_MPEG4_PART2 4
+#define HISI_DVB_STREAMTYPE_MPEG1 6
+#define HISI_DVB_STREAMTYPE_HEVC 7
 #define HISI_DVB_STREAMTYPE_VP8 8
 #define HISI_DVB_STREAMTYPE_VP9 9
+#define HISI_DVB_STREAMTYPE_MJPEG 30
 #define HISI_FFMPEG_VDEC_LIBRARY "libHV.VIDEO.FFMPEG_VDEC.decode.so"
 #define HISI_FFMPEG_AVCODEC_LIBRARY "libavcodec.so.57"
 #define HISI_FFMPEG_AVCODEC_ID_VP8 140
@@ -514,6 +522,87 @@ static void release_dvb_pending(struct hisi_instance* instance)
   instance->pending_boundary = 0;
 }
 
+#if STBP_HISI_LINUX_DVB
+static size_t find_annex_b_start_code(const uint8_t* data,
+                                      size_t size,
+                                      size_t offset,
+                                      size_t* prefix_size)
+{
+  size_t position;
+
+  for (position = offset; position + 3U <= size; ++position)
+  {
+    if (data[position] != 0U || data[position + 1U] != 0U)
+      continue;
+    if (data[position + 2U] == 1U)
+    {
+      *prefix_size = 3U;
+      return position;
+    }
+    if (position + 4U <= size && data[position + 2U] == 0U &&
+        data[position + 3U] == 1U)
+    {
+      *prefix_size = 4U;
+      return position;
+    }
+  }
+  *prefix_size = 0U;
+  return size;
+}
+
+static enum stbp_result store_linux_dvb_hevc_codec_data(
+    struct hisi_instance* instance,
+    const uint8_t* data,
+    size_t size)
+{
+  uint8_t* filtered;
+  size_t output_size = 0U;
+  size_t position = 0U;
+
+  filtered = (uint8_t*)malloc(size);
+  if (filtered == NULL)
+    return STBP_ERROR_BACKEND;
+
+  while (position < size)
+  {
+    size_t prefix_size;
+    size_t next_prefix_size;
+    const size_t start = find_annex_b_start_code(data, size, position, &prefix_size);
+    size_t next;
+    size_t nal_start;
+    uint8_t nal_type;
+
+    if (start == size)
+      break;
+    nal_start = start + prefix_size;
+    if (nal_start >= size)
+      break;
+    next = find_annex_b_start_code(data, size, nal_start + 1U, &next_prefix_size);
+    nal_type = (uint8_t)((data[nal_start] >> 1U) & 0x3fU);
+    if (nal_type == 32U || nal_type == 33U || nal_type == 34U)
+    {
+      const size_t nal_size = next - start;
+      memcpy(filtered + output_size, data + start, nal_size);
+      output_size += nal_size;
+    }
+    position = next;
+  }
+
+  /* A conforming hvcC conversion contains VPS/SPS/PPS. If the frontend sends
+   * an unfamiliar Annex-B layout, preserve it rather than silently opening
+   * the decoder without any configuration data. */
+  if (output_size == 0U)
+  {
+    memcpy(filtered, data, size);
+    output_size = size;
+  }
+  instance->codec_data = filtered;
+  instance->codec_data_size = output_size;
+  instance->send_codec_data = 1;
+  return STBP_OK;
+}
+#endif
+
 static void hisi_log_errno(struct hisi_instance* instance,
                            enum stbp_log_level level,
                            const char* operation)
@@ -577,6 +666,35 @@ static size_t make_dvb_bcmv_header(uint8_t header[10],
   return 10U;
 }
 
+static int linux_dvb_stream_type(enum stbp_codec codec)
+{
+  switch (codec)
+  {
+    case STBP_CODEC_MPEG1:
+      return HISI_DVB_STREAMTYPE_MPEG1;
+    case STBP_CODEC_MPEG2:
+      return HISI_DVB_STREAMTYPE_MPEG2;
+    case STBP_CODEC_MPEG4_PART2:
+      return HISI_DVB_STREAMTYPE_MPEG4_PART2;
+    case STBP_CODEC_H263:
+      return HISI_DVB_STREAMTYPE_H263;
+    case STBP_CODEC_H264:
+      return HISI_DVB_STREAMTYPE_H264;
+    case STBP_CODEC_HEVC:
+      return HISI_DVB_STREAMTYPE_HEVC;
+    case STBP_CODEC_VC1:
+      return HISI_DVB_STREAMTYPE_VC1;
+    case STBP_CODEC_VP8:
+      return HISI_DVB_STREAMTYPE_VP8;
+    case STBP_CODEC_VP9:
+      return HISI_DVB_STREAMTYPE_VP9;
+    case STBP_CODEC_MJPEG:
+      return HISI_DVB_STREAMTYPE_MJPEG;
+    default:
+      return -1;
+  }
+}
+
 static enum stbp_result flush_dvb_pending_locked(struct hisi_instance* instance)
 {
   while (instance->pending_offset < instance->pending_size)
@@ -617,24 +735,36 @@ static enum stbp_result prepare_dvb_packet_locked(struct hisi_instance* instance
   const int64_t pts = packet->pts_90k != STBP_PTS_NONE ? packet->pts_90k
                                                         : packet->dts_90k;
   const size_t pes_size = make_dvb_pes_header(pes_header, pts);
-  const size_t bcmv_size = make_dvb_bcmv_header(bcmv_header, instance->codec,
-                                                packet->size);
+  const size_t codec_data_size = instance->send_codec_data ? instance->codec_data_size : 0U;
+  const size_t bcmv_size = instance->codec == STBP_CODEC_VP8 ||
+                                   instance->codec == STBP_CODEC_VP9
+                               ? make_dvb_bcmv_header(bcmv_header, instance->codec,
+                                                      packet->size)
+                               : 0U;
   size_t total_size;
 
-  if (pes_size > SIZE_MAX - bcmv_size || pes_size + bcmv_size > SIZE_MAX - packet->size)
+  if (pes_size > SIZE_MAX - codec_data_size ||
+      pes_size + codec_data_size > SIZE_MAX - bcmv_size ||
+      pes_size + codec_data_size + bcmv_size > SIZE_MAX - packet->size)
     return STBP_ERROR_INVALID_ARGUMENT;
-  total_size = pes_size + bcmv_size + packet->size;
-  set_dvb_pes_payload_size(pes_header, pes_size - 6U + bcmv_size + packet->size);
+  total_size = pes_size + codec_data_size + bcmv_size + packet->size;
+  set_dvb_pes_payload_size(pes_header,
+                           pes_size - 6U + codec_data_size + bcmv_size + packet->size);
   instance->pending = (uint8_t*)malloc(total_size);
   if (instance->pending == NULL)
     return STBP_ERROR_BACKEND;
   memcpy(instance->pending, pes_header, pes_size);
-  memcpy(instance->pending + pes_size, bcmv_header, bcmv_size);
+  if (codec_data_size != 0U)
+    memcpy(instance->pending + pes_size, instance->codec_data, codec_data_size);
+  if (bcmv_size != 0U)
+    memcpy(instance->pending + pes_size + codec_data_size, bcmv_header, bcmv_size);
   if (packet->size != 0U)
-    memcpy(instance->pending + pes_size + bcmv_size, packet->data, packet->size);
+    memcpy(instance->pending + pes_size + codec_data_size + bcmv_size,
+           packet->data, packet->size);
   instance->pending_size = total_size;
   instance->pending_offset = 0U;
-  instance->pending_boundary = pes_size + bcmv_size;
+  instance->pending_boundary = pes_size + codec_data_size + bcmv_size;
+  instance->send_codec_data = 0;
   return STBP_OK;
 }
 
@@ -655,10 +785,12 @@ static int dvb_can_accept_packet(int fd)
 static enum stbp_result open_linux_dvb_locked(struct hisi_instance* instance,
                                               const struct stbp_stream_config* stream)
 {
-  const int stream_type = stream->codec == STBP_CODEC_VP8 ? HISI_DVB_STREAMTYPE_VP8
-                                                           : HISI_DVB_STREAMTYPE_VP9;
+  const int stream_type = linux_dvb_stream_type(stream->codec);
   hi_s32 result;
   char message[256];
+
+  if (stream_type < 0)
+    return STBP_ERROR_UNSUPPORTED;
 
   /* Enigma2 has already initialised the legacy HiSilicon system layer before
    * dvbvideosink opens /dev/dvb/adapter0/video0. Kodi starts after Enigma2
@@ -667,7 +799,7 @@ static enum stbp_result open_linux_dvb_locked(struct hisi_instance* instance,
   result = HI_SYS_Init();
   if (result != HI_SUCCESS)
   {
-    hisi_log_result(instance, STBP_LOG_ERROR, "HI_SYS_Init(MV310 DVB)", result);
+    hisi_log_result(instance, STBP_LOG_ERROR, "HI_SYS_Init(Linux-DVB)", result);
     return STBP_ERROR_BACKEND;
   }
   instance->sys_initialized = 1;
@@ -706,7 +838,7 @@ static enum stbp_result open_linux_dvb_locked(struct hisi_instance* instance,
   instance->last_error = STBP_OK;
   instance->last_pts_90k = STBP_PTS_NONE;
   (void)snprintf(message, sizeof(message),
-                 "HiSilicon MV310 Linux-DVB PES video path opened: codec=%d streamtype=%d %ux%u profile=%d",
+                 "HiSilicon Linux-DVB PES video path opened: codec=%d streamtype=%d %ux%u profile=%d",
                  (int)stream->codec, stream_type, stream->width, stream->height,
                  stream->codec_profile);
   hisi_log(instance, STBP_LOG_INFO, message);
@@ -731,6 +863,7 @@ static enum stbp_result queue_linux_dvb_locked(struct hisi_instance* instance,
       return STBP_ERROR_IO;
     }
     (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
+    instance->send_codec_data = instance->codec_data_size != 0U;
   }
   result = prepare_dvb_packet_locked(instance, packet);
   if (result != STBP_OK)
@@ -744,7 +877,7 @@ static enum stbp_result queue_linux_dvb_locked(struct hisi_instance* instance,
     const unsigned int b2 = packet->size > 2U ? data[2] : 0U;
     const unsigned int b3 = packet->size > 3U ? data[3] : 0U;
     (void)snprintf(message, sizeof(message),
-                   "MV310 DVB packet %llu: size=%zu pts=%lld dts=%lld flags=0x%x data=%02x%02x%02x%02x",
+                   "HiSilicon DVB packet %llu: size=%zu pts=%lld dts=%lld flags=0x%x data=%02x%02x%02x%02x",
                    (unsigned long long)instance->packets_queued, packet->size,
                    (long long)packet->pts_90k, (long long)packet->dts_90k,
                    packet->flags, b0, b1, b2, b3);
@@ -761,7 +894,7 @@ static enum stbp_result queue_linux_dvb_locked(struct hisi_instance* instance,
   {
     char message[192];
     (void)snprintf(message, sizeof(message),
-                   "MV310 DVB submitted: packets=%llu writes=%llu bytes=%llu pending=%zu",
+                   "HiSilicon DVB submitted: packets=%llu writes=%llu bytes=%llu pending=%zu",
                    (unsigned long long)instance->packets_queued,
                    (unsigned long long)instance->dvb_write_calls,
                    (unsigned long long)instance->dvb_bytes_written,
@@ -921,9 +1054,11 @@ static enum stbp_result hisi_probe(void* opaque, struct stbp_capabilities* capab
                              STBP_CODEC_BIT(STBP_CODEC_VP8) |
                              STBP_CODEC_BIT(STBP_CODEC_VP9) |
                              STBP_CODEC_BIT(STBP_CODEC_MJPEG);
-  capabilities->feature_mask = STBP_FEATURE_PAUSE | STBP_FEATURE_VIDEO_RECT |
-                               STBP_FEATURE_VISIBILITY | STBP_FEATURE_PRESENTATION_CLOCK |
+  capabilities->feature_mask = STBP_FEATURE_PAUSE | STBP_FEATURE_PRESENTATION_CLOCK |
                                STBP_FEATURE_DRAIN | STBP_FEATURE_INTERLACED;
+#if !STBP_HISI_LINUX_DVB
+  capabilities->feature_mask |= STBP_FEATURE_VIDEO_RECT | STBP_FEATURE_VISIBILITY;
+#endif
   capabilities->max_width = 3840;
   capabilities->max_height = 2160;
   capabilities->max_packet_size = HISI_MAX_PACKET_SIZE;
@@ -970,13 +1105,32 @@ static enum stbp_result hisi_open(void* opaque,
   }
   if (stream->extra_data_size != 0)
   {
-    instance->codec_data = (uint8_t*)malloc(stream->extra_data_size);
-    if (instance->codec_data == NULL)
-      goto failed;
-    memcpy(instance->codec_data, stream->extra_data, stream->extra_data_size);
-    instance->codec_data_size = stream->extra_data_size;
-    instance->send_codec_data = 1;
+#if STBP_HISI_LINUX_DVB
+    if (stream->codec == STBP_CODEC_HEVC)
+    {
+      final_result = store_linux_dvb_hevc_codec_data(
+          instance, (const uint8_t*)stream->extra_data, stream->extra_data_size);
+      if (final_result != STBP_OK)
+        goto failed;
+    }
+    else
+#endif
+    {
+      instance->codec_data = (uint8_t*)malloc(stream->extra_data_size);
+      if (instance->codec_data == NULL)
+        goto failed;
+      memcpy(instance->codec_data, stream->extra_data, stream->extra_data_size);
+      instance->codec_data_size = stream->extra_data_size;
+      instance->send_codec_data = 1;
+    }
   }
+
+#if STBP_HISI_LINUX_DVB
+  final_result = open_linux_dvb_locked(instance, stream);
+  if (final_result == STBP_OK)
+    goto done;
+  goto failed;
+#endif
 
 #define HISI_OPEN_CALL(call, name)                                                                 \
   do                                                                                               \
@@ -1362,6 +1516,7 @@ static enum stbp_result hisi_flush(void* opaque, int64_t next_pts_90k)
     {
       (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
       instance->state = STBP_STATE_OPEN;
+      instance->send_codec_data = instance->codec_data_size != 0U;
       instance->last_pts_90k = next_pts_90k;
     }
   }
@@ -1549,7 +1704,7 @@ static const struct stbp_backend_api_v1 hisi_api = {
     STBP_ABI_VERSION_1,
     sizeof(struct stbp_backend_api_v1),
     "hisi-dvb",
-    "0.3.4-avplay-mv310-ffmpeg-context",
+    "0.3.6-linux-dvb-pes",
     hisi_create,
     hisi_destroy,
     hisi_probe,

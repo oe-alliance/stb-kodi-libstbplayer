@@ -8,6 +8,7 @@ include(CTest)
 option(STBP_BUILD_TESTS "Build the fake backend and ABI tests" ON)
 option(STBP_BUILD_HISI_DVB_BACKEND "Build the Linux-DVB backend used by HiSilicon STBs" OFF)
 option(STBP_HISI_MV310 "Use the explicit MV310 AVPLAY decoder allocation" OFF)
+option(STBP_HISI_LINUX_DVB "Use the receiver Linux-DVB video driver instead of AVPLAY" OFF)
 option(STBP_BUILD_BCM_DVB_BACKEND "Build the Linux-DVB/PES backend used by Broadcom STBs" OFF)
 option(STBP_BUILD_DREAM_AML_BACKEND "Build the native DreamOne/DreamTwo Amlogic backend" OFF)
 set(STBP_BCM_DVB_VARIANT "normal" CACHE STRING
@@ -75,6 +76,7 @@ if(STBP_BUILD_HISI_DVB_BACKEND)
   target_include_directories(stbplayer-backend-hisi-dvb PRIVATE include)
   target_compile_definitions(stbplayer-backend-hisi-dvb PRIVATE
     STBP_HISI_MV310=$<BOOL:${STBP_HISI_MV310}>
+    STBP_HISI_LINUX_DVB=$<BOOL:${STBP_HISI_LINUX_DVB}>
   )
   # The closed HiSilicon SDK libraries are supplied under different OE recipe
   # names by each receiver brand.  Kodi's HiSi wrapper preloads the common ABI

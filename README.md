@@ -148,6 +148,14 @@ explicit AVPLAY decoder allocation. The HiSilicon build also installs
 `stb-hisi-display`, a helper used by affected images to initialize the vendor
 virtual screen before EGL starts.
 
+Set `-DSTBP_HISI_LINUX_DVB=ON` for receiver drivers whose Enigma2
+`dvbvideosink` feeds compressed video through `/dev/dvb/adapter0/video0`.
+This mode uses the receiver's Linux-DVB stream types and PES framing instead
+of opening a separate AVPLAY/VO window. It is a driver-family choice, not a
+generic HiSilicon default; verified OE recipes currently enable it for the
+GFutures HD60/HD61/HD66, AB-COM Pulse, Maxytec Multibox and Zgemma HiSilicon
+families.
+
 ### Broadcom
 
 ```sh
