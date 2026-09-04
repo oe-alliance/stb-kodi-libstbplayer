@@ -137,6 +137,17 @@ static enum stbp_result fake_reset(void* instance)
   return STBP_OK;
 }
 
+static enum stbp_result fake_sync_clock(void* instance, int64_t pts_90k)
+{
+  struct fake_instance* fake = (struct fake_instance*)instance;
+  if (fake == NULL || pts_90k == STBP_PTS_NONE)
+    return STBP_ERROR_INVALID_ARGUMENT;
+  if (fake->status.state == STBP_STATE_CLOSED)
+    return STBP_ERROR_BAD_STATE;
+  fake->status.presentation_pts_90k = pts_90k;
+  return STBP_OK;
+}
+
 static enum stbp_result fake_set_speed(void* instance, struct stbp_rational speed)
 {
   if (instance == NULL || speed.denominator == 0)
@@ -192,6 +203,7 @@ static const struct stbp_backend_api_v1 fake_api = {
     fake_flush,
     fake_drain,
     fake_reset,
+    fake_sync_clock,
     fake_set_speed,
     fake_set_paused,
     fake_set_video_rect,
@@ -205,4 +217,3 @@ STBP_EXPORT const struct stbp_backend_api_v1* stbp_backend_get_api(uint32_t host
     return NULL;
   return &fake_api;
 }
-

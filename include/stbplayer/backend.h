@@ -82,7 +82,9 @@ enum stbp_feature
   STBP_FEATURE_DRAIN = UINT64_C(1) << 6,
   STBP_FEATURE_INTERLACED = UINT64_C(1) << 7,
   STBP_FEATURE_HDR10 = UINT64_C(1) << 8,
-  STBP_FEATURE_HLG = UINT64_C(1) << 9
+  STBP_FEATURE_HLG = UINT64_C(1) << 9,
+  /* Delay Kodi's first post-reset picture until hardware PTS reaches it. */
+  STBP_FEATURE_STARTUP_PTS_GATE = UINT64_C(1) << 10
 };
 
 enum stbp_packet_flag
@@ -223,6 +225,9 @@ struct stbp_backend_api_v1
   enum stbp_result (*flush)(void* instance, int64_t next_pts_90k);
   enum stbp_result (*drain)(void* instance);
   enum stbp_result (*reset)(void* instance);
+  /* Align the hardware presentation clock to the frontend master clock
+   * without flushing queued decoder data. */
+  enum stbp_result (*sync_clock)(void* instance, int64_t pts_90k);
   enum stbp_result (*set_speed)(void* instance, struct stbp_rational speed);
   enum stbp_result (*set_paused)(void* instance, int paused);
   enum stbp_result (*set_video_rect)(void* instance,

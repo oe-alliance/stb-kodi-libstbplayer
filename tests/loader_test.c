@@ -75,6 +75,12 @@ int main(int argc, char** argv)
   if (!require_result(api->get_status(instance, &status), STBP_OK, "status") ||
       status.presentation_pts_90k != packet.pts_90k || status.packets_queued != 1)
     return 1;
+  if (!require_result(api->sync_clock(instance, 225000), STBP_OK, "sync clock"))
+    return 1;
+  status.struct_size = sizeof(status);
+  if (!require_result(api->get_status(instance, &status), STBP_OK, "status after clock sync") ||
+      status.presentation_pts_90k != 225000)
+    return 1;
   if (!require_result(api->flush(instance, 270000), STBP_OK, "flush"))
     return 1;
   if (!require_result(api->close(instance), STBP_OK, "close"))
@@ -84,4 +90,3 @@ int main(int argc, char** argv)
   stbp_backend_unload(loaded);
   return 0;
 }
-

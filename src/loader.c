@@ -51,7 +51,8 @@ static int api_has_required_functions(const struct stbp_backend_api_v1* api)
   return api->create != NULL && api->destroy != NULL && api->probe != NULL &&
          api->open != NULL && api->queue_packet != NULL && api->get_buffer_state != NULL &&
          api->get_status != NULL && api->flush != NULL && api->drain != NULL &&
-         api->reset != NULL && api->set_speed != NULL && api->set_paused != NULL &&
+         api->reset != NULL && api->sync_clock != NULL && api->set_speed != NULL &&
+         api->set_paused != NULL &&
          api->set_video_rect != NULL && api->set_visible != NULL && api->close != NULL;
 }
 

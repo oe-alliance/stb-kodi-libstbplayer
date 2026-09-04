@@ -9,6 +9,7 @@
  */
 #include "stbplayer/backend.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/dvb/video.h>
@@ -19,10 +20,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BCM_VIDEO_DEVICE "/dev/dvb/adapter0/video0"
 #define BCM_FALLBACK_FRAMERATE "/proc/stb/vmpeg/0/fallback_framerate"
+#define BCM_STC_HOST_DEVICE "/dev/stb-stc-host"
+#define BCM_NEXUS_STC_SETTINGS_SIZE 512U
+#define BCM_NEXUS_STC_MODE_OFFSET sizeof(uint32_t)
+#define BCM_NEXUS_STC_MODE_HOST 2U
+#ifndef STBP_BCM_DVB_NEXUS_STC
+#define STBP_BCM_DVB_NEXUS_STC 0
+#endif
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+#define BCM_VIDEO_MODE "/proc/stb/video/videomode"
+#define BCM_VIDEO_MODE_24HZ "/proc/stb/video/videomode_24hz"
+#define BCM_VIDEO_MODE_50HZ "/proc/stb/video/videomode_50hz"
+#define BCM_VIDEO_MODE_60HZ "/proc/stb/video/videomode_60hz"
+#define BCM_VIDEO_MODE_SIZE 64U
+#endif
 #define BCM_STREAMTYPE_MPEG2 0
 #define BCM_STREAMTYPE_H264 1
 #define BCM_STREAMTYPE_H263 2
@@ -61,6 +77,13 @@
 #define BCM_VP9_FIRST_PES_SIZE 0x8008U
 #define BCM_VP9_TRAILER_SIZE 184U
 
+typedef void (*bcm_nexus_stc_get_default_fn)(unsigned int, void*);
+typedef void* (*bcm_nexus_stc_open_fn)(unsigned int, const void*);
+typedef void (*bcm_nexus_stc_close_fn)(void*);
+typedef int (*bcm_nexus_stc_set_stc_fn)(void*, uint32_t);
+typedef int (*bcm_nexus_stc_freeze_fn)(void*, int);
+typedef int (*bcm_nexus_stc_set_rate_fn)(void*, unsigned int, unsigned int);
+
 struct bcm_instance
 {
   struct stbp_host_callbacks host;
@@ -81,6 +104,36 @@ struct bcm_instance
   uint64_t packets_queued;
   uint64_t packets_dropped;
   int64_t last_pts_90k;
+  int stc_host_enabled;
+  int stc_needs_seed;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  int decoder_has_data;
+  int resume_startup_pending;
+#endif
+  int startup_preroll;
+  uint32_t startup_preroll_packets;
+  int64_t startup_preroll_first_pts_90k;
+  int64_t startup_preroll_last_pts_90k;
+  int64_t startup_sync_floor_pts_90k;
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+  int startup_catchup_active;
+  int64_t startup_catchup_target_pts_90k;
+  uint64_t startup_catchup_deadline_ms;
+#endif
+#if STBP_BCM_DVB_NEXUS_STC
+  void* nexus_library;
+  void* nexus_stc_channel;
+  bcm_nexus_stc_close_fn nexus_stc_close;
+  bcm_nexus_stc_set_stc_fn nexus_stc_set_stc;
+  bcm_nexus_stc_freeze_fn nexus_stc_freeze;
+  bcm_nexus_stc_set_rate_fn nexus_stc_set_rate;
+#endif
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+  int video_modes_pinned;
+  char video_mode_24hz[BCM_VIDEO_MODE_SIZE];
+  char video_mode_50hz[BCM_VIDEO_MODE_SIZE];
+  char video_mode_60hz[BCM_VIDEO_MODE_SIZE];
+#endif
 };
 
 static void bcm_log(struct bcm_instance* instance,
@@ -100,6 +153,235 @@ static void bcm_log_errno(struct bcm_instance* instance,
   (void)snprintf(message, sizeof(message), "%s failed: %s (%d)", operation,
                  strerror(saved_errno), saved_errno);
   bcm_log(instance, level, message);
+}
+
+static int write_stc_command(struct bcm_instance* instance, const char* command)
+{
+  const size_t size = strlen(command);
+  int fd;
+  ssize_t written;
+
+  fd = open(BCM_STC_HOST_DEVICE, O_WRONLY | O_CLOEXEC);
+  if (fd < 0)
+    return 0;
+  do
+  {
+    written = write(fd, command, size);
+  } while (written < 0 && errno == EINTR);
+  (void)close(fd);
+  if (written != (ssize_t)size)
+  {
+    bcm_log_errno(instance, STBP_LOG_WARNING, "setting Broadcom host STC");
+    return 0;
+  }
+  return 1;
+}
+
+#if STBP_BCM_DVB_NEXUS_STC
+static int open_nexus_host_stc(struct bcm_instance* instance)
+{
+  unsigned char settings[BCM_NEXUS_STC_SETTINGS_SIZE] __attribute__((aligned(8)));
+  const uint32_t host_mode = BCM_NEXUS_STC_MODE_HOST;
+  bcm_nexus_stc_get_default_fn get_default;
+  bcm_nexus_stc_open_fn open_channel;
+
+  if (instance->nexus_stc_channel != NULL)
+    return 1;
+  instance->nexus_library = dlopen("libnexus.so", RTLD_NOW | RTLD_LOCAL);
+  if (instance->nexus_library == NULL)
+    return 0;
+  get_default = (bcm_nexus_stc_get_default_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_GetDefaultSettings");
+  open_channel = (bcm_nexus_stc_open_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_Open");
+  instance->nexus_stc_close = (bcm_nexus_stc_close_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_Close");
+  instance->nexus_stc_set_stc = (bcm_nexus_stc_set_stc_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_SetStc");
+  instance->nexus_stc_freeze = (bcm_nexus_stc_freeze_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_Freeze");
+  instance->nexus_stc_set_rate = (bcm_nexus_stc_set_rate_fn)dlsym(
+      instance->nexus_library, "NEXUS_StcChannel_SetRate");
+  if (get_default == NULL || open_channel == NULL ||
+      instance->nexus_stc_close == NULL || instance->nexus_stc_set_stc == NULL ||
+      instance->nexus_stc_freeze == NULL || instance->nexus_stc_set_rate == NULL)
+    goto failed;
+
+  /* The Nexus ABI starts NEXUS_StcChannelSettings with two 32-bit enums:
+   * timebase followed by mode.  Keep the vendor-extended tail opaque so this
+   * remains compatible with the receiver's installed libnexus revision. */
+  memset(settings, 0, sizeof(settings));
+  get_default(0, settings);
+  memcpy(settings + BCM_NEXUS_STC_MODE_OFFSET, &host_mode, sizeof(host_mode));
+  instance->nexus_stc_channel = open_channel(0, settings);
+  if (instance->nexus_stc_channel == NULL)
+    goto failed;
+  bcm_log(instance, STBP_LOG_INFO, "Broadcom Nexus host STC channel opened");
+  return 1;
+
+failed:
+  instance->nexus_stc_close = NULL;
+  instance->nexus_stc_set_stc = NULL;
+  instance->nexus_stc_freeze = NULL;
+  instance->nexus_stc_set_rate = NULL;
+  (void)dlclose(instance->nexus_library);
+  instance->nexus_library = NULL;
+  return 0;
+}
+
+static void close_nexus_host_stc(struct bcm_instance* instance)
+{
+  if (instance->nexus_stc_channel != NULL && instance->nexus_stc_close != NULL)
+    instance->nexus_stc_close(instance->nexus_stc_channel);
+  instance->nexus_stc_channel = NULL;
+  instance->nexus_stc_close = NULL;
+  instance->nexus_stc_set_stc = NULL;
+  instance->nexus_stc_freeze = NULL;
+  instance->nexus_stc_set_rate = NULL;
+  if (instance->nexus_library != NULL)
+    (void)dlclose(instance->nexus_library);
+  instance->nexus_library = NULL;
+}
+#endif
+
+static int host_stc_available(const struct bcm_instance* instance)
+{
+  if (access(BCM_STC_HOST_DEVICE, W_OK) == 0)
+    return 1;
+#if STBP_BCM_DVB_NEXUS_STC
+  return instance->nexus_stc_channel != NULL;
+#else
+  (void)instance;
+  return 0;
+#endif
+}
+
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+static int read_proc_value(const char* path, char* value, size_t capacity)
+{
+  ssize_t length;
+  int fd;
+
+  if (value == NULL || capacity < 2U)
+    return 0;
+  fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return 0;
+  do
+  {
+    length = read(fd, value, capacity - 1U);
+  } while (length < 0 && errno == EINTR);
+  (void)close(fd);
+  if (length <= 0)
+    return 0;
+  while (length > 0 && (value[length - 1] == '\n' || value[length - 1] == '\r' ||
+                        value[length - 1] == ' ' || value[length - 1] == '\t'))
+    --length;
+  value[length] = '\0';
+  return length > 0;
+}
+
+static int write_proc_value(const char* path, const char* value)
+{
+  const size_t length = strlen(value);
+  ssize_t written;
+  int fd;
+
+  fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0)
+    return 0;
+  do
+  {
+    written = write(fd, value, length);
+  } while (written < 0 && errno == EINTR);
+  (void)close(fd);
+  return written == (ssize_t)length;
+}
+
+static void restore_gigablue_video_modes(struct bcm_instance* instance)
+{
+  if (!instance->video_modes_pinned)
+    return;
+  (void)write_proc_value(BCM_VIDEO_MODE_24HZ, instance->video_mode_24hz);
+  (void)write_proc_value(BCM_VIDEO_MODE_50HZ, instance->video_mode_50hz);
+  (void)write_proc_value(BCM_VIDEO_MODE_60HZ, instance->video_mode_60hz);
+  instance->video_modes_pinned = 0;
+  bcm_log(instance, STBP_LOG_INFO, "GigaBlue automatic HDMI modes restored");
+}
+
+static int pin_gigablue_video_modes(struct bcm_instance* instance)
+{
+  char current_mode[BCM_VIDEO_MODE_SIZE];
+
+  if (!read_proc_value(BCM_VIDEO_MODE, current_mode, sizeof(current_mode)) ||
+      !read_proc_value(BCM_VIDEO_MODE_24HZ, instance->video_mode_24hz,
+                       sizeof(instance->video_mode_24hz)) ||
+      !read_proc_value(BCM_VIDEO_MODE_50HZ, instance->video_mode_50hz,
+                       sizeof(instance->video_mode_50hz)) ||
+      !read_proc_value(BCM_VIDEO_MODE_60HZ, instance->video_mode_60hz,
+                       sizeof(instance->video_mode_60hz)))
+    return 0;
+
+  instance->video_modes_pinned = 1;
+  if (!write_proc_value(BCM_VIDEO_MODE_24HZ, current_mode) ||
+      !write_proc_value(BCM_VIDEO_MODE_50HZ, current_mode) ||
+      !write_proc_value(BCM_VIDEO_MODE_60HZ, current_mode))
+  {
+    restore_gigablue_video_modes(instance);
+    return 0;
+  }
+  bcm_log(instance, STBP_LOG_INFO, "GigaBlue automatic HDMI modes pinned to Kodi output");
+  return 1;
+}
+#endif
+
+static int seed_host_stc(struct bcm_instance* instance, int64_t pts_90k)
+{
+  char command[48];
+  char message[160];
+  uint32_t stc;
+  int length;
+
+  if (pts_90k == STBP_PTS_NONE)
+    return 0;
+  /* Kodi's initial GENERAL_RESYNC can legitimately carry a small negative
+   * preroll timestamp. The hardware clock is unsigned; wrapping that value
+   * near UINT32_MAX makes the decoder wait instead of presenting PTS zero. */
+  stc = pts_90k < 0 ? 0U : (uint32_t)pts_90k;
+#if STBP_BCM_DVB_NEXUS_STC
+  if (instance->nexus_stc_channel != NULL && instance->nexus_stc_set_stc != NULL)
+  {
+    if (instance->nexus_stc_set_rate == NULL || instance->nexus_stc_freeze == NULL ||
+        /* This Nexus generation advances the host clock at 45 kHz for rate
+         * (1,0). MPEG/Kodi PTS use 90 kHz; the measured normal rate is (2,0). */
+        instance->nexus_stc_set_rate(instance->nexus_stc_channel, 2U, 0U) != 0 ||
+        instance->nexus_stc_set_stc(instance->nexus_stc_channel,
+                                    stc) != 0 ||
+        instance->nexus_stc_freeze(instance->nexus_stc_channel, 0) != 0)
+    {
+      instance->stc_needs_seed = 0;
+      return 0;
+    }
+    instance->stc_host_enabled = 1;
+    instance->stc_needs_seed = 0;
+    (void)snprintf(message, sizeof(message),
+                   "Broadcom Nexus clock switched to host STC: clock=%u, request=%lld, queued-video=%lld",
+                   stc, (long long)pts_90k, (long long)instance->last_pts_90k);
+    bcm_log(instance, STBP_LOG_INFO, message);
+    return 1;
+  }
+#endif
+  length = snprintf(command, sizeof(command), "host %u", stc);
+  if (length <= 0 || (size_t)length >= sizeof(command) ||
+      !write_stc_command(instance, command))
+  {
+    instance->stc_needs_seed = 0;
+    return 0;
+  }
+  instance->stc_host_enabled = 1;
+  instance->stc_needs_seed = 0;
+  bcm_log(instance, STBP_LOG_INFO, "Broadcom video clock switched to host STC");
+  return 1;
 }
 
 static int codec_to_stream_type(enum stbp_codec codec)
@@ -315,10 +597,27 @@ static enum stbp_result prepare_standard_packet_locked(struct bcm_instance* inst
   instance->pending = (uint8_t*)malloc(total_size);
   if (instance->pending == NULL)
     return STBP_ERROR_BACKEND;
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+  /* Gigablue's reference dvbvideosink submits codec data, the PES header and
+   * the encoded access unit in separate writes.  Its Nexus DVB driver parses
+   * the stream headers from a combined write but never presents a frame
+   * (VIDEO_GET_PTS remains zero).  Preserve the reference syscall boundaries. */
+  instance->pending_boundaries =
+      (size_t*)malloc((raw_codec_size != 0U ? 2U : 1U) *
+                      sizeof(*instance->pending_boundaries));
+  if (instance->pending_boundaries == NULL)
+  {
+    release_pending(instance);
+    return STBP_ERROR_BACKEND;
+  }
+#endif
   if (raw_codec_size != 0U)
   {
     memcpy(instance->pending + offset, instance->codec_data, raw_codec_size);
     offset += raw_codec_size;
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+    instance->pending_boundaries[instance->pending_boundary_count++] = offset;
+#endif
   }
   memcpy(instance->pending + offset, pes_header, pes_header_size);
   offset += pes_header_size;
@@ -332,6 +631,10 @@ static enum stbp_result prepare_standard_packet_locked(struct bcm_instance* inst
     memcpy(instance->pending + offset, prefix, prefix_size);
     offset += prefix_size;
   }
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+  instance->pending_boundaries[instance->pending_boundary_count++] = offset;
+  instance->pending_boundary_index = 0U;
+#endif
   if (packet->size != 0U)
     memcpy(instance->pending + offset, packet->data, packet->size);
   instance->pending_size = total_size;
@@ -643,6 +946,29 @@ static int fd_can_accept_packet(int fd)
   return result > 0 && (descriptor.revents & POLLOUT) != 0;
 }
 
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+static uint64_t monotonic_milliseconds(void)
+{
+  struct timespec now;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    return 0;
+  return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+static void stop_startup_catchup_locked(struct bcm_instance* instance, const char* reason)
+{
+  if (!instance->startup_catchup_active)
+    return;
+  (void)ioctl(instance->video_fd, VIDEO_FAST_FORWARD, 0);
+  (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
+  instance->startup_catchup_active = 0;
+  instance->startup_catchup_target_pts_90k = STBP_PTS_NONE;
+  instance->startup_catchup_deadline_ms = 0;
+  bcm_log(instance, STBP_LOG_INFO, reason);
+}
+#endif
+
 static enum stbp_result close_locked(struct bcm_instance* instance)
 {
   enum stbp_result final_result = STBP_OK;
@@ -650,6 +976,10 @@ static enum stbp_result close_locked(struct bcm_instance* instance)
   release_pending(instance);
   if (instance->video_fd >= 0)
   {
+    if (instance->stc_host_enabled && access(BCM_STC_HOST_DEVICE, W_OK) == 0)
+      (void)write_stc_command(instance, "auto");
+    instance->stc_host_enabled = 0;
+    instance->stc_needs_seed = 0;
     if (ioctl(instance->video_fd, VIDEO_STOP) < 0 && errno != EINVAL)
     {
       bcm_log_errno(instance, STBP_LOG_WARNING, "VIDEO_STOP");
@@ -662,11 +992,31 @@ static enum stbp_result close_locked(struct bcm_instance* instance)
     (void)close(instance->video_fd);
     instance->video_fd = -1;
   }
+#if STBP_BCM_DVB_NEXUS_STC
+  close_nexus_host_stc(instance);
+#endif
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+  restore_gigablue_video_modes(instance);
+#endif
 
   release_codec_data(instance);
   instance->state = STBP_STATE_CLOSED;
   instance->codec = STBP_CODEC_UNKNOWN;
   instance->last_pts_90k = STBP_PTS_NONE;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  instance->decoder_has_data = 0;
+  instance->resume_startup_pending = 0;
+#endif
+  instance->startup_preroll = 0;
+  instance->startup_preroll_packets = 0U;
+  instance->startup_preroll_first_pts_90k = STBP_PTS_NONE;
+  instance->startup_preroll_last_pts_90k = STBP_PTS_NONE;
+  instance->startup_sync_floor_pts_90k = STBP_PTS_NONE;
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+  instance->startup_catchup_active = 0;
+  instance->startup_catchup_target_pts_90k = STBP_PTS_NONE;
+  instance->startup_catchup_deadline_ms = 0;
+#endif
   return final_result;
 }
 
@@ -744,6 +1094,9 @@ static enum stbp_result bcm_probe(void* opaque, struct stbp_capabilities* capabi
                                STBP_FEATURE_PRESENTATION_CLOCK |
                                STBP_FEATURE_DRAIN |
                                STBP_FEATURE_INTERLACED;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  capabilities->feature_mask |= STBP_FEATURE_STARTUP_PTS_GATE;
+#endif
   capabilities->max_width = 4096;
   capabilities->max_height = 2160;
   capabilities->max_packet_size = BCM_MAX_PACKET_SIZE;
@@ -792,6 +1145,11 @@ static enum stbp_result bcm_open(void* opaque,
   if (!configure_codec_data(instance, stream))
     goto failed;
 
+#if STBP_BCM_DVB_NEXUS_STC
+  if (access(BCM_STC_HOST_DEVICE, W_OK) != 0 && !open_nexus_host_stc(instance))
+    bcm_log(instance, STBP_LOG_WARNING, "Broadcom Nexus host STC is unavailable");
+#endif
+
   instance->video_fd = open(BCM_VIDEO_DEVICE, O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (instance->video_fd < 0)
   {
@@ -803,7 +1161,8 @@ static enum stbp_result bcm_open(void* opaque,
    * previous Enigma2 decoder surface until the device buffer is cleared.
    * The TYPE2 xcore driver uses the reference E2 order without either
    * startup clear; clearing here prevents HEVC from starting on BCM73565. */
-#if !defined(STBP_BCM_DVB_VARIANT_TYPE2)
+#if !defined(STBP_BCM_DVB_VARIANT_TYPE2) && \
+    !defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
   if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
     bcm_log_errno(instance, STBP_LOG_DEBUG, "initial VIDEO_CLEAR_BUFFER");
 #endif
@@ -820,6 +1179,15 @@ static enum stbp_result bcm_open(void* opaque,
     bcm_log_errno(instance, STBP_LOG_ERROR, "VIDEO_SET_STREAMTYPE");
     goto failed;
   }
+#if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
+  /* This Nexus DVB driver independently selects one of its 24/50/60 Hz mode
+   * aliases from the elementary-stream header after VIDEO_PLAY.  That can
+   * override Kodi's container-PTS based choice (for example a 25 fps MKV with
+   * a stale 23.976 SPS). Pin every alias to Kodi's current output for the
+   * decoder lifetime; close_locked restores Enigma2's original mappings. */
+  if (!pin_gigablue_video_modes(instance))
+    bcm_log(instance, STBP_LOG_WARNING, "GigaBlue automatic HDMI modes could not be pinned");
+#endif
   if (ioctl(instance->video_fd, VIDEO_PLAY) < 0)
   {
     bcm_log_errno(instance, STBP_LOG_ERROR, "VIDEO_PLAY");
@@ -832,7 +1200,8 @@ static enum stbp_result bcm_open(void* opaque,
   }
   /* Keep the BCM7425 post-start reset, but do not disturb the TYPE2 decoder
    * after VIDEO_PLAY/VIDEO_CONTINUE. */
-#if !defined(STBP_BCM_DVB_VARIANT_TYPE2)
+#if !defined(STBP_BCM_DVB_VARIANT_TYPE2) && \
+    !defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
   if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
     bcm_log_errno(instance, STBP_LOG_DEBUG, "post-start VIDEO_CLEAR_BUFFER");
 #endif
@@ -841,6 +1210,22 @@ static enum stbp_result bcm_open(void* opaque,
   instance->state = STBP_STATE_OPEN;
   instance->last_error = STBP_OK;
   instance->last_pts_90k = STBP_PTS_NONE;
+  instance->stc_host_enabled = 0;
+  instance->stc_needs_seed = host_stc_available(instance);
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  instance->decoder_has_data = 0;
+  instance->resume_startup_pending = 0;
+#endif
+  instance->startup_preroll = 1;
+  instance->startup_preroll_packets = 0U;
+  instance->startup_preroll_first_pts_90k = STBP_PTS_NONE;
+  instance->startup_preroll_last_pts_90k = STBP_PTS_NONE;
+  instance->startup_sync_floor_pts_90k = STBP_PTS_NONE;
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+  instance->startup_catchup_active = 0;
+  instance->startup_catchup_target_pts_90k = STBP_PTS_NONE;
+  instance->startup_catchup_deadline_ms = 0;
+#endif
   bcm_log(instance, STBP_LOG_INFO, "Broadcom Linux-DVB PES video path opened");
   final_result = STBP_OK;
   goto done;
@@ -885,9 +1270,76 @@ static enum stbp_result bcm_queue_packet(void* opaque, const struct stbp_packet*
       goto done;
     }
     instance->send_codec_data = instance->codec_data_size != 0;
+    instance->stc_needs_seed = host_stc_available(instance);
   }
 
   pts = packet->pts_90k != STBP_PTS_NONE ? packet->pts_90k : packet->dts_90k;
+  /* A file resume opens a fresh decoder and Kodi feeds the preceding GOP as
+   * decode-only packets before the requested resume timestamp. Track that
+   * startup-only GOP so the normal Broadcom driver can consume it in trick
+   * mode without changing the already proven ordinary-seek path. */
+  if (instance->startup_preroll && (packet->flags & STBP_PACKET_DROP) != 0)
+  {
+    if (instance->startup_preroll_packets == 0U)
+      instance->startup_preroll_first_pts_90k = pts;
+    instance->startup_preroll_last_pts_90k = pts;
+    ++instance->startup_preroll_packets;
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+    /* A single frame is within normal decoder startup tolerance. Enter trick
+     * mode only after a real multi-frame GOP preroll has been confirmed. */
+    if (instance->startup_preroll_packets == 2U)
+    {
+      if (ioctl(instance->video_fd, VIDEO_FAST_FORWARD, 8) == 0)
+      {
+        (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
+        instance->startup_catchup_active = 1;
+        bcm_log(instance, STBP_LOG_INFO,
+                "Broadcom startup preroll catch-up enabled at 8x");
+      }
+      else
+        bcm_log_errno(instance, STBP_LOG_DEBUG, "startup VIDEO_FAST_FORWARD");
+    }
+#endif
+  }
+  else if (instance->startup_preroll)
+  {
+    if (instance->startup_preroll_packets != 0U)
+    {
+      char message[224];
+      (void)snprintf(message, sizeof(message),
+                     "Broadcom startup preroll: %u decode-only packets, pts=%lld..%lld",
+                     instance->startup_preroll_packets,
+                     (long long)instance->startup_preroll_first_pts_90k,
+                     (long long)instance->startup_preroll_last_pts_90k);
+      bcm_log(instance, STBP_LOG_INFO, message);
+    }
+    instance->startup_sync_floor_pts_90k = pts;
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+    if (instance->startup_catchup_active)
+    {
+      instance->startup_catchup_target_pts_90k = pts;
+      instance->startup_catchup_deadline_ms = monotonic_milliseconds() + 2000U;
+    }
+#endif
+    instance->startup_preroll = 0;
+  }
+  /* Keep accurate-seek preroll in the decoder so H.264/HEVC reference state
+   * is rebuilt. Backends with a presentation-clock bridge decide when their
+   * clock can be bootstrapped. Kodi's GENERAL_RESYNC later supplies audio and
+   * video with one common clock after both stream players have entered their
+   * synchronized state. */
+#if STBP_BCM_DVB_NEXUS_STC
+  /* A Nexus host channel starts frozen on receivers without the kernel STC
+   * bridge.  Waiting exclusively for Kodi's GENERAL_RESYNC deadlocks startup:
+   * Kodi waits for the first decoded picture while the decoder waits for a
+   * running STC.  Bootstrap it from the first presentation packet; Kodi's
+   * later GENERAL_RESYNC still replaces this value with the common A/V clock.
+   * Accurate-seek preroll packets remain queued without being presented. */
+  if (instance->stc_needs_seed && instance->nexus_stc_channel != NULL &&
+      (packet->flags & STBP_PACKET_DROP) == 0 && pts != STBP_PTS_NONE &&
+      !seed_host_stc(instance, pts))
+    bcm_log(instance, STBP_LOG_WARNING, "Broadcom Nexus startup STC could not be seeded");
+#endif
   result = codec_uses_bcmv(instance->codec)
                ? prepare_bcmv_packet_locked(instance, packet, pts)
                : prepare_standard_packet_locked(instance, packet, pts);
@@ -901,10 +1353,14 @@ static enum stbp_result bcm_queue_packet(void* opaque, const struct stbp_packet*
     result = STBP_OK;
   if (result == STBP_OK)
   {
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+    instance->decoder_has_data = 1;
+#endif
     ++instance->packets_queued;
     if ((packet->flags & STBP_PACKET_DROP) != 0)
       ++instance->packets_dropped;
-    instance->last_pts_90k = pts;
+    if ((packet->flags & STBP_PACKET_DROP) == 0)
+      instance->last_pts_90k = pts;
   }
 
 done:
@@ -954,6 +1410,23 @@ static enum stbp_result bcm_get_status(void* opaque, struct stbp_status* status)
   (void)pthread_mutex_lock(&instance->mutex);
   status->state = instance->state;
   status->last_error = instance->last_error;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  /* Dreambox exposes a useful decoder presentation PTS. Do not replace a
+   * not-yet-started zero value with the last queued packet: Kodi uses the
+   * distinction to defer its first post-resume A/V synchronization. */
+  status->presentation_pts_90k = STBP_PTS_NONE;
+  if (instance->video_fd >= 0 && ioctl(instance->video_fd, VIDEO_GET_PTS, &decoder_pts) == 0 &&
+      decoder_pts != 0)
+  {
+    status->presentation_pts_90k = (int64_t)decoder_pts;
+    if (instance->resume_startup_pending)
+    {
+      instance->resume_startup_pending = 0;
+      bcm_log(instance, STBP_LOG_INFO,
+              "Dreambox resume decoder PTS ready; normal pause handling restored");
+    }
+  }
+#else
   status->presentation_pts_90k = instance->last_pts_90k;
   /* Some VU+ Broadcom drivers report a successful VIDEO_GET_PTS ioctl but
    * return zero for the complete memory-source session.  Zero is not useful
@@ -963,6 +1436,25 @@ static enum stbp_result bcm_get_status(void* opaque, struct stbp_status* status)
   if (instance->video_fd >= 0 && ioctl(instance->video_fd, VIDEO_GET_PTS, &decoder_pts) == 0 &&
       (decoder_pts != 0 || instance->last_pts_90k == 0))
     status->presentation_pts_90k = (int64_t)decoder_pts;
+#endif
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+  if (instance->startup_catchup_active &&
+      instance->startup_catchup_target_pts_90k != STBP_PTS_NONE)
+  {
+    const uint64_t now_ms = monotonic_milliseconds();
+    const int caught_up = decoder_pts != 0 &&
+                          (int64_t)decoder_pts + 4500 >=
+                              instance->startup_catchup_target_pts_90k;
+    const int timed_out = instance->startup_catchup_deadline_ms != 0 &&
+                          now_ms != 0 && now_ms >= instance->startup_catchup_deadline_ms;
+    if (caught_up)
+      stop_startup_catchup_locked(instance,
+                                  "Broadcom startup preroll catch-up complete");
+    else if (timed_out)
+      stop_startup_catchup_locked(instance,
+                                  "Broadcom startup preroll catch-up timed out");
+  }
+#endif
   status->packets_queued = instance->packets_queued;
   status->packets_dropped = instance->packets_dropped;
   (void)pthread_mutex_unlock(&instance->mutex);
@@ -973,6 +1465,9 @@ static enum stbp_result bcm_flush(void* opaque, int64_t next_pts_90k)
 {
   struct bcm_instance* instance = (struct bcm_instance*)opaque;
   enum stbp_result result = STBP_OK;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  int clear_decoder;
+#endif
 
   if (instance == NULL)
     return STBP_ERROR_INVALID_ARGUMENT;
@@ -981,7 +1476,32 @@ static enum stbp_result bcm_flush(void* opaque, int64_t next_pts_90k)
     result = STBP_ERROR_BAD_STATE;
   else
   {
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+    /* Kodi seeks to a saved resume point immediately after opening a fresh
+     * decoder. Dreambox BCM drivers can stop presenting permanently when an
+     * empty decoder is cleared between VIDEO_PLAY and its first PES packet.
+     * Once data has entered the decoder, ordinary seek flushes retain the
+     * established VIDEO_CLEAR_BUFFER path. */
+    clear_decoder = instance->decoder_has_data;
+#endif
     release_pending(instance);
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+    if (!clear_decoder)
+    {
+      /* Keep the just-opened decoder completely untouched. Even nominally
+       * harmless speed/continue ioctls before its first PES timestamp can
+       * establish a wrong internal time mapping on Dreambox BCM drivers. */
+      instance->state = STBP_STATE_OPEN;
+      instance->send_codec_data = instance->codec_data_size != 0;
+      instance->last_pts_90k = next_pts_90k;
+      instance->stc_needs_seed = host_stc_available(instance);
+      instance->decoder_has_data = 0;
+      instance->resume_startup_pending = 1;
+      bcm_log(instance, STBP_LOG_INFO,
+              "Dreambox initial resume flush left the empty decoder untouched");
+      goto flush_done;
+    }
+#endif
     if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
     {
       bcm_log_errno(instance, STBP_LOG_ERROR, "VIDEO_CLEAR_BUFFER");
@@ -989,14 +1509,26 @@ static enum stbp_result bcm_flush(void* opaque, int64_t next_pts_90k)
     }
     else
     {
+#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+      stop_startup_catchup_locked(instance,
+                                  "Broadcom startup preroll catch-up cancelled by flush");
+#endif
       (void)ioctl(instance->video_fd, VIDEO_FAST_FORWARD, 0);
       (void)ioctl(instance->video_fd, VIDEO_SLOWMOTION, 0);
       (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
       instance->state = STBP_STATE_OPEN;
       instance->send_codec_data = instance->codec_data_size != 0;
       instance->last_pts_90k = next_pts_90k;
+      instance->stc_needs_seed = host_stc_available(instance);
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+      instance->decoder_has_data = 0;
+      instance->resume_startup_pending = 0;
+#endif
     }
   }
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+flush_done:
+#endif
   (void)pthread_mutex_unlock(&instance->mutex);
   return result;
 }
@@ -1033,6 +1565,49 @@ static enum stbp_result bcm_reset(void* opaque)
   return result;
 }
 
+static enum stbp_result bcm_sync_clock(void* opaque, int64_t pts_90k)
+{
+  struct bcm_instance* instance = (struct bcm_instance*)opaque;
+  enum stbp_result result = STBP_OK;
+  int64_t sync_pts_90k = pts_90k;
+
+  if (instance == NULL || pts_90k == STBP_PTS_NONE)
+    return STBP_ERROR_INVALID_ARGUMENT;
+  (void)pthread_mutex_lock(&instance->mutex);
+  if (instance->state != STBP_STATE_OPEN && instance->state != STBP_STATE_PAUSED)
+    result = STBP_ERROR_BAD_STATE;
+  else if (!host_stc_available(instance))
+    result = STBP_ERROR_UNSUPPORTED;
+  else
+  {
+    /* Kodi's first common-clock value after a file resume can precede the
+     * first displayable video PTS by the audio decoder's startup preroll. Do
+     * not move an already bootstrapped hardware clock backwards across that
+     * first picture; doing so starts audio while Broadcom waits to present it.
+     * The floor is stream-derived and consumed once, so normal seek clock
+     * synchronization is unaffected. */
+    if (instance->startup_sync_floor_pts_90k != STBP_PTS_NONE)
+    {
+      if (sync_pts_90k < instance->startup_sync_floor_pts_90k)
+      {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "Broadcom startup clock clamped: request=%lld, first-video=%lld",
+                       (long long)sync_pts_90k,
+                       (long long)instance->startup_sync_floor_pts_90k);
+        bcm_log(instance, STBP_LOG_INFO, message);
+        sync_pts_90k = instance->startup_sync_floor_pts_90k;
+      }
+      instance->startup_sync_floor_pts_90k = STBP_PTS_NONE;
+    }
+    if (!seed_host_stc(instance, sync_pts_90k))
+      result = STBP_ERROR_IO;
+  }
+  instance->last_error = result;
+  (void)pthread_mutex_unlock(&instance->mutex);
+  return result;
+}
+
 static enum stbp_result bcm_set_speed(void* opaque, struct stbp_rational speed)
 {
   (void)opaque;
@@ -1051,13 +1626,35 @@ static enum stbp_result bcm_set_paused(void* opaque, int paused)
   (void)pthread_mutex_lock(&instance->mutex);
   if (instance->state != STBP_STATE_OPEN && instance->state != STBP_STATE_PAUSED)
     result = STBP_ERROR_BAD_STATE;
+#if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
+  else if (paused && instance->resume_startup_pending)
+  {
+    /* Kodi pauses both players while filling its startup cache. Applying that
+     * pause before Dream's first decoder PTS creates a circular wait: Kodi
+     * waits for a picture while the decoder waits for Kodi to resume. Keep
+     * decoding until GetStatus observes the first valid hardware PTS. */
+    bcm_log(instance, STBP_LOG_INFO,
+            "Dreambox resume startup pause deferred until decoder PTS");
+  }
+#endif
   else if (ioctl(instance->video_fd, paused ? VIDEO_FREEZE : VIDEO_CONTINUE) < 0)
   {
     bcm_log_errno(instance, STBP_LOG_ERROR, paused ? "VIDEO_FREEZE" : "VIDEO_CONTINUE");
     result = STBP_ERROR_IO;
   }
   else
+  {
     instance->state = paused ? STBP_STATE_PAUSED : STBP_STATE_OPEN;
+    if (instance->stc_host_enabled)
+    {
+#if STBP_BCM_DVB_NEXUS_STC
+      if (instance->nexus_stc_channel != NULL && instance->nexus_stc_freeze != NULL)
+        (void)instance->nexus_stc_freeze(instance->nexus_stc_channel, paused != 0);
+      else
+#endif
+        (void)write_stc_command(instance, paused ? "freeze 1" : "freeze 0");
+    }
+  }
   (void)pthread_mutex_unlock(&instance->mutex);
   return result;
 }
@@ -1099,6 +1696,7 @@ static const struct stbp_backend_api_v1 bcm_api = {
     bcm_flush,
     bcm_drain,
     bcm_reset,
+    bcm_sync_clock,
     bcm_set_speed,
     bcm_set_paused,
     bcm_set_video_rect,

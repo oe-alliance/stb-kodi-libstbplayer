@@ -54,7 +54,7 @@ available on the target machine.
 | Backend | Platform | Hardware interface | Notes |
 | --- | --- | --- | --- |
 | `hisi-dvb` | HiSilicon ARM receivers | HiSilicon AVPLAY/VO SDK, with Linux-DVB support where required | Vendor `libhi_*` libraries and `/dev/hi_vdec` plus `/dev/hi_vo` must be supplied by the receiver image. H.264 and HEVC input must be Annex B. |
-| `bcm-dvb` | Broadcom ARM and MIPSel receivers | `/dev/dvb/adapter0/video0`, DVB video ioctls and PES framing | Supports driver-specific `normal`, `type2`, `dreambox` and `vuplus` framing variants. Optional codecs are selected at build time from the machine capabilities. |
+| `bcm-dvb` | Broadcom ARM and MIPSel receivers | `/dev/dvb/adapter0/video0`, DVB video ioctls and PES framing | Supports driver-specific `normal`, `type2`, `dreambox`, `vuplus` and `gigablue` variants. Optional codecs are selected at build time from the machine capabilities. |
 | `dream-aml` | Dreambox One and Dreambox Two | Dreambox direct-frame DVB ABI and the Amlogic `amvideo` plane | Uses `/dev/dvb/adapter0/video0`, `/dev/amvideo_poll` and the Dreambox Amlogic sysfs controls. It is not the CoreELEC V4L2 path. H.264 and HEVC input must be Annex B. |
 | `fake` | Development host | No hardware | Built only for tests; exercises loading, ABI negotiation, packet ownership, status, flush and teardown. |
 
@@ -168,7 +168,27 @@ cmake -S . -B build-bcm \
 cmake --build build-bcm --parallel
 ```
 
-`STBP_BCM_DVB_VARIANT` accepts `normal`, `type2`, `dreambox` or `vuplus`.
+`STBP_BCM_DVB_VARIANT` accepts `normal`, `type2`, `dreambox`, `vuplus` or
+`gigablue`. The Gigablue variant preserves the vendor GStreamer startup order
+and its separate PES-header/access-unit writes. It also does not clear the
+decoder after `VIDEO_PLAY`; on BCM7252 a combined write prevents frames from
+being presented, while the clear can restore the stale Enigma2 surface.
+
+`STBP_BCM_DVB_NEXUS_STC` enables the optional Broadcom host-clock integration.
+The backend first uses `/dev/stb-stc-host` when a compatible kernel bridge is
+available and otherwise tries the userspace Nexus ABI. If neither interface is
+usable, playback automatically retains decoder-PTS synchronization. Old Vu+
+MIPSel drivers own the only full Nexus STC channel and expose no accessor for
+the decoder's `SimpleStcChannel`; do not install the kernel bridge for these
+receivers. Their decoder-PTS fallback has been verified with normal playback,
+repeated seeks and stop/resume on a Vu+ Solo2.
+
+On the `normal` Broadcom variant, startup resume preroll is tracked separately
+from ordinary seeks. Kodi's decode-only GOP is retained for reference-frame
+reconstruction and consumed in temporary DVB trick mode until the hardware PTS
+reaches the first displayable packet. A timeout always restores normal speed.
+The other Broadcom variants keep their established startup behavior.
+
 The following Boolean options must match the receiver driver:
 
 - `STBP_BCM_DVB_HAVE_HEVC`

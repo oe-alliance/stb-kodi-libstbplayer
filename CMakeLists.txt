@@ -12,8 +12,8 @@ option(STBP_HISI_LINUX_DVB "Use the receiver Linux-DVB video driver instead of A
 option(STBP_BUILD_BCM_DVB_BACKEND "Build the Linux-DVB/PES backend used by Broadcom STBs" OFF)
 option(STBP_BUILD_DREAM_AML_BACKEND "Build the native DreamOne/DreamTwo Amlogic backend" OFF)
 set(STBP_BCM_DVB_VARIANT "normal" CACHE STRING
-    "Broadcom DVB stream-type/framing variant: normal, type2, dreambox or vuplus")
-set_property(CACHE STBP_BCM_DVB_VARIANT PROPERTY STRINGS normal type2 dreambox vuplus)
+    "Broadcom DVB stream-type/framing variant: normal, type2, dreambox, vuplus or gigablue")
+set_property(CACHE STBP_BCM_DVB_VARIANT PROPERTY STRINGS normal type2 dreambox vuplus gigablue)
 option(STBP_BCM_DVB_HAVE_HEVC "Advertise Broadcom HEVC decoding" OFF)
 option(STBP_BCM_DVB_HAVE_WMV "Advertise Broadcom VC-1/WMV3 decoding" OFF)
 option(STBP_BCM_DVB_HAVE_VP6 "Advertise Broadcom VP6 decoding" OFF)
@@ -21,6 +21,7 @@ option(STBP_BCM_DVB_HAVE_VP8 "Advertise Broadcom VP8 decoding" OFF)
 option(STBP_BCM_DVB_HAVE_VP9 "Advertise Broadcom VP9 decoding" OFF)
 option(STBP_BCM_DVB_HAVE_SPARK "Advertise Broadcom Sorenson Spark decoding" OFF)
 option(STBP_BCM_DVB_LIMITED_MPEG4V2 "Limit MPEG-4 Part 2 codecs to 800x600" OFF)
+option(STBP_BCM_DVB_NEXUS_STC "Use the userspace Nexus host STC API" OFF)
 set(STBP_DEFAULT_BACKEND_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/stbplayer" CACHE PATH
     "Default directory containing STB player backends")
 
@@ -111,7 +112,7 @@ if(STBP_BUILD_DREAM_AML_BACKEND)
 endif()
 
 if(STBP_BUILD_BCM_DVB_BACKEND)
-  if(NOT STBP_BCM_DVB_VARIANT MATCHES "^(normal|type2|dreambox|vuplus)$")
+  if(NOT STBP_BCM_DVB_VARIANT MATCHES "^(normal|type2|dreambox|vuplus|gigablue)$")
     message(FATAL_ERROR "Unsupported STBP_BCM_DVB_VARIANT: ${STBP_BCM_DVB_VARIANT}")
   endif()
   find_package(Threads REQUIRED)
@@ -128,8 +129,9 @@ if(STBP_BUILD_BCM_DVB_BACKEND)
     STBP_BCM_DVB_HAVE_VP9=$<BOOL:${STBP_BCM_DVB_HAVE_VP9}>
     STBP_BCM_DVB_HAVE_SPARK=$<BOOL:${STBP_BCM_DVB_HAVE_SPARK}>
     STBP_BCM_DVB_LIMITED_MPEG4V2=$<BOOL:${STBP_BCM_DVB_LIMITED_MPEG4V2}>
+    STBP_BCM_DVB_NEXUS_STC=$<BOOL:${STBP_BCM_DVB_NEXUS_STC}>
   )
-  target_link_libraries(stbplayer-backend-bcm-dvb PRIVATE Threads::Threads)
+  target_link_libraries(stbplayer-backend-bcm-dvb PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   set_target_properties(stbplayer-backend-bcm-dvb PROPERTIES
     PREFIX "lib"
     OUTPUT_NAME "stbplayer-backend-bcm-dvb"

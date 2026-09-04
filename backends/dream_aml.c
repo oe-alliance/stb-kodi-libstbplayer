@@ -992,6 +992,13 @@ static enum stbp_result dream_reset(void* opaque)
   return result;
 }
 
+static enum stbp_result dream_sync_clock(void* opaque, int64_t pts_90k)
+{
+  if (opaque == NULL || pts_90k == STBP_PTS_NONE)
+    return STBP_ERROR_INVALID_ARGUMENT;
+  return STBP_ERROR_UNSUPPORTED;
+}
+
 static enum stbp_result dream_set_speed(void* opaque, struct stbp_rational speed)
 {
   (void)opaque;
@@ -1092,6 +1099,7 @@ static const struct stbp_backend_api_v1 dream_api = {
     dream_flush,
     dream_drain,
     dream_reset,
+    dream_sync_clock,
     dream_set_speed,
     dream_set_paused,
     dream_set_video_rect,

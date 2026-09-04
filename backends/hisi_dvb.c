@@ -1583,6 +1583,13 @@ static enum stbp_result hisi_reset(void* opaque)
   return result;
 }
 
+static enum stbp_result hisi_sync_clock(void* opaque, int64_t pts_90k)
+{
+  if (opaque == NULL || pts_90k == STBP_PTS_NONE)
+    return STBP_ERROR_INVALID_ARGUMENT;
+  return STBP_ERROR_UNSUPPORTED;
+}
+
 static enum stbp_result hisi_set_speed(void* opaque, struct stbp_rational speed)
 {
   (void)opaque;
@@ -1715,6 +1722,7 @@ static const struct stbp_backend_api_v1 hisi_api = {
     hisi_flush,
     hisi_drain,
     hisi_reset,
+    hisi_sync_clock,
     hisi_set_speed,
     hisi_set_paused,
     hisi_set_video_rect,
