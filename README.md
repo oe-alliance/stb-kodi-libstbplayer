@@ -164,6 +164,7 @@ cmake -S . -B build-bcm \
   -DSTBP_BUILD_TESTS=OFF \
   -DSTBP_BUILD_BCM_DVB_BACKEND=ON \
   -DSTBP_BCM_DVB_VARIANT=normal \
+  -DSTBP_BCM_DVB_STARTUP_CATCHUP=ON \
   -DSTBP_BCM_DVB_HAVE_HEVC=ON
 cmake --build build-bcm --parallel
 ```
@@ -183,11 +184,14 @@ the decoder's `SimpleStcChannel`; do not install the kernel bridge for these
 receivers. Their decoder-PTS fallback has been verified with normal playback,
 repeated seeks and stop/resume on a Vu+ Solo2.
 
-On the `normal` Broadcom variant, startup resume preroll is tracked separately
-from ordinary seeks. Kodi's decode-only GOP is retained for reference-frame
-reconstruction and consumed in temporary DVB trick mode until the hardware PTS
-reaches the first displayable packet. A timeout always restores normal speed.
-The other Broadcom variants keep their established startup behavior.
+`STBP_BCM_DVB_STARTUP_CATCHUP` enables startup resume-preroll handling for the
+`normal` and `vuplus` Broadcom variants. Kodi's decode-only GOP is retained for
+reference-frame reconstruction and consumed in temporary DVB trick mode until
+the hardware PTS reaches the first displayable packet. This is required on the
+normal receiver drivers and official Vu+ ARM drivers, where the occupied Nexus
+STC channel is private and a long GOP would otherwise let audio advance before
+video. A timeout always restores normal speed. The option stays disabled for
+the already verified Vu+ MIPSel path and other Broadcom variants.
 
 The following Boolean options must match the receiver driver:
 

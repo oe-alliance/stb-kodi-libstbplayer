@@ -22,6 +22,7 @@ option(STBP_BCM_DVB_HAVE_VP9 "Advertise Broadcom VP9 decoding" OFF)
 option(STBP_BCM_DVB_HAVE_SPARK "Advertise Broadcom Sorenson Spark decoding" OFF)
 option(STBP_BCM_DVB_LIMITED_MPEG4V2 "Limit MPEG-4 Part 2 codecs to 800x600" OFF)
 option(STBP_BCM_DVB_NEXUS_STC "Use the userspace Nexus host STC API" OFF)
+option(STBP_BCM_DVB_STARTUP_CATCHUP "Decode long Broadcom resume preroll in temporary trick mode" OFF)
 set(STBP_DEFAULT_BACKEND_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/stbplayer" CACHE PATH
     "Default directory containing STB player backends")
 
@@ -130,6 +131,7 @@ if(STBP_BUILD_BCM_DVB_BACKEND)
     STBP_BCM_DVB_HAVE_SPARK=$<BOOL:${STBP_BCM_DVB_HAVE_SPARK}>
     STBP_BCM_DVB_LIMITED_MPEG4V2=$<BOOL:${STBP_BCM_DVB_LIMITED_MPEG4V2}>
     STBP_BCM_DVB_NEXUS_STC=$<BOOL:${STBP_BCM_DVB_NEXUS_STC}>
+    STBP_BCM_DVB_STARTUP_CATCHUP=$<BOOL:${STBP_BCM_DVB_STARTUP_CATCHUP}>
   )
   target_link_libraries(stbplayer-backend-bcm-dvb PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   set_target_properties(stbplayer-backend-bcm-dvb PROPERTIES

@@ -32,6 +32,15 @@
 #ifndef STBP_BCM_DVB_NEXUS_STC
 #define STBP_BCM_DVB_NEXUS_STC 0
 #endif
+#ifndef STBP_BCM_DVB_STARTUP_CATCHUP
+#define STBP_BCM_DVB_STARTUP_CATCHUP 0
+#endif
+#if STBP_BCM_DVB_STARTUP_CATCHUP && \
+    (defined(STBP_BCM_DVB_VARIANT_NORMAL) || defined(STBP_BCM_DVB_VARIANT_VUPLUS))
+#define BCM_STARTUP_PREROLL_CATCHUP 1
+#else
+#define BCM_STARTUP_PREROLL_CATCHUP 0
+#endif
 #if defined(STBP_BCM_DVB_VARIANT_GIGABLUE)
 #define BCM_VIDEO_MODE "/proc/stb/video/videomode"
 #define BCM_VIDEO_MODE_24HZ "/proc/stb/video/videomode_24hz"
@@ -115,7 +124,7 @@ struct bcm_instance
   int64_t startup_preroll_first_pts_90k;
   int64_t startup_preroll_last_pts_90k;
   int64_t startup_sync_floor_pts_90k;
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
   int startup_catchup_active;
   int64_t startup_catchup_target_pts_90k;
   uint64_t startup_catchup_deadline_ms;
@@ -946,7 +955,7 @@ static int fd_can_accept_packet(int fd)
   return result > 0 && (descriptor.revents & POLLOUT) != 0;
 }
 
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
 static uint64_t monotonic_milliseconds(void)
 {
   struct timespec now;
@@ -1012,7 +1021,7 @@ static enum stbp_result close_locked(struct bcm_instance* instance)
   instance->startup_preroll_first_pts_90k = STBP_PTS_NONE;
   instance->startup_preroll_last_pts_90k = STBP_PTS_NONE;
   instance->startup_sync_floor_pts_90k = STBP_PTS_NONE;
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
   instance->startup_catchup_active = 0;
   instance->startup_catchup_target_pts_90k = STBP_PTS_NONE;
   instance->startup_catchup_deadline_ms = 0;
@@ -1221,7 +1230,7 @@ static enum stbp_result bcm_open(void* opaque,
   instance->startup_preroll_first_pts_90k = STBP_PTS_NONE;
   instance->startup_preroll_last_pts_90k = STBP_PTS_NONE;
   instance->startup_sync_floor_pts_90k = STBP_PTS_NONE;
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
   instance->startup_catchup_active = 0;
   instance->startup_catchup_target_pts_90k = STBP_PTS_NONE;
   instance->startup_catchup_deadline_ms = 0;
@@ -1284,9 +1293,12 @@ static enum stbp_result bcm_queue_packet(void* opaque, const struct stbp_packet*
       instance->startup_preroll_first_pts_90k = pts;
     instance->startup_preroll_last_pts_90k = pts;
     ++instance->startup_preroll_packets;
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
     /* A single frame is within normal decoder startup tolerance. Enter trick
-     * mode only after a real multi-frame GOP preroll has been confirmed. */
+     * mode only after a real multi-frame GOP preroll has been confirmed.
+     * Official Vu+ ARM drivers cannot expose their occupied Nexus STC channel;
+     * without this temporary catch-up, a long resume GOP is decoded in real
+     * time while Kodi audio already advances from the requested timestamp. */
     if (instance->startup_preroll_packets == 2U)
     {
       if (ioctl(instance->video_fd, VIDEO_FAST_FORWARD, 8) == 0)
@@ -1314,7 +1326,7 @@ static enum stbp_result bcm_queue_packet(void* opaque, const struct stbp_packet*
       bcm_log(instance, STBP_LOG_INFO, message);
     }
     instance->startup_sync_floor_pts_90k = pts;
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
     if (instance->startup_catchup_active)
     {
       instance->startup_catchup_target_pts_90k = pts;
@@ -1437,7 +1449,7 @@ static enum stbp_result bcm_get_status(void* opaque, struct stbp_status* status)
       (decoder_pts != 0 || instance->last_pts_90k == 0))
     status->presentation_pts_90k = (int64_t)decoder_pts;
 #endif
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
   if (instance->startup_catchup_active &&
       instance->startup_catchup_target_pts_90k != STBP_PTS_NONE)
   {
@@ -1509,7 +1521,7 @@ static enum stbp_result bcm_flush(void* opaque, int64_t next_pts_90k)
     }
     else
     {
-#if defined(STBP_BCM_DVB_VARIANT_NORMAL)
+#if BCM_STARTUP_PREROLL_CATCHUP
       stop_startup_catchup_locked(instance,
                                   "Broadcom startup preroll catch-up cancelled by flush");
 #endif
