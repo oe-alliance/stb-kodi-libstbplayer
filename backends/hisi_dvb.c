@@ -11,6 +11,12 @@
  * libstbplayer ABI instead of forking Kodi's VideoPlayer.
  */
 #include "stbplayer/backend.h"
+#if STBP_DVB_AUDIO_HISI_VIDEO_CLOCK
+#include "hisi_audio_clock.h"
+#endif
+#if STBP_DVB_AUDIO_HISI_PCM_TRACK
+#include "hisi_pcm.h"
+#endif
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -833,6 +839,9 @@ static enum stbp_result open_linux_dvb_locked(struct hisi_instance* instance,
     return STBP_ERROR_BACKEND;
   }
   instance->linux_dvb_mode = 1;
+#if STBP_DVB_AUDIO_HISI_VIDEO_CLOCK
+  stbp_hisi_audio_clock_attach(instance->video_fd);
+#endif
   instance->codec = stream->codec;
   instance->state = STBP_STATE_OPEN;
   instance->last_error = STBP_OK;
@@ -842,6 +851,28 @@ static enum stbp_result open_linux_dvb_locked(struct hisi_instance* instance,
                  (int)stream->codec, stream_type, stream->width, stream->height,
                  stream->codec_profile);
   hisi_log(instance, STBP_LOG_INFO, message);
+  return STBP_OK;
+}
+
+static enum stbp_result flush_linux_dvb_video_locked(struct hisi_instance* instance)
+{
+#if STBP_DVB_AUDIO_HISI_PCM_TRACK
+  const enum stbp_result result = stbp_hisi_pcm_flush_video(instance->video_fd);
+  if (result != STBP_ERROR_UNSUPPORTED)
+  {
+    if (result == STBP_OK)
+      hisi_log(instance, STBP_LOG_INFO, "HiSilicon native PCM video decoder restarted after flush");
+    else
+      hisi_log_errno(instance, STBP_LOG_ERROR, "restarting HiSilicon PCM video decoder");
+    return result;
+  }
+#endif
+  if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
+  {
+    hisi_log_errno(instance, STBP_LOG_ERROR, "VIDEO_CLEAR_BUFFER");
+    return STBP_ERROR_IO;
+  }
+  (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
   return STBP_OK;
 }
 
@@ -857,12 +888,9 @@ static enum stbp_result queue_linux_dvb_locked(struct hisi_instance* instance,
     return STBP_ERROR_UNSUPPORTED;
   if ((packet->flags & STBP_PACKET_DISCONTINUITY) != 0)
   {
-    if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
-    {
-      hisi_log_errno(instance, STBP_LOG_ERROR, "VIDEO_CLEAR_BUFFER(discontinuity)");
-      return STBP_ERROR_IO;
-    }
-    (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
+    result = flush_linux_dvb_video_locked(instance);
+    if (result != STBP_OK)
+      return result;
     instance->send_codec_data = instance->codec_data_size != 0U;
   }
   result = prepare_dvb_packet_locked(instance, packet);
@@ -917,6 +945,9 @@ static enum stbp_result close_locked(struct hisi_instance* instance)
   release_dvb_pending(instance);
   if (instance->video_fd >= 0)
   {
+#if STBP_DVB_AUDIO_HISI_VIDEO_CLOCK
+    stbp_hisi_audio_clock_detach(instance->video_fd);
+#endif
     if (ioctl(instance->video_fd, VIDEO_STOP) < 0 && errno != EINVAL)
     {
       hisi_log_errno(instance, STBP_LOG_WARNING, "VIDEO_STOP");
@@ -1507,14 +1538,9 @@ static enum stbp_result hisi_flush(void* opaque, int64_t next_pts_90k)
   else if (instance->linux_dvb_mode)
   {
     release_dvb_pending(instance);
-    if (ioctl(instance->video_fd, VIDEO_CLEAR_BUFFER) < 0)
+    final_result = flush_linux_dvb_video_locked(instance);
+    if (final_result == STBP_OK)
     {
-      hisi_log_errno(instance, STBP_LOG_ERROR, "VIDEO_CLEAR_BUFFER");
-      final_result = STBP_ERROR_IO;
-    }
-    else
-    {
-      (void)ioctl(instance->video_fd, VIDEO_CONTINUE);
       instance->state = STBP_STATE_OPEN;
       instance->send_codec_data = instance->codec_data_size != 0U;
       instance->last_pts_90k = next_pts_90k;

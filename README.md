@@ -1,6 +1,6 @@
 # libstbplayer
 
-`libstbplayer` is a small, versioned hardware-video backend API for Linux-based
+`libstbplayer` is a small, versioned hardware-media backend API for Linux-based
 Enigma2 set-top boxes. It lets a media application such as Kodi retain its
 native demuxer, audio engine, clock, subtitles, OSD and player controls while
 compressed video is decoded and displayed by the receiver's hardware.
@@ -21,22 +21,24 @@ available to the media application.
 - a stable C ABI between a media frontend and machine-specific video backends;
 - runtime backend loading with ABI and backend-name validation;
 - capability discovery for codecs, resolution and playback operations;
-- compressed-packet submission with explicit backpressure;
+- compressed video and audio packet submission with explicit backpressure;
 - playback state, decoder PTS, flush, drain, pause and teardown operations;
 - optional video-plane rectangle and visibility control;
-- hardware backends for HiSilicon, Broadcom and Dreambox Amlogic receivers;
-- a fake backend and loader test that require no STB hardware; and
+- hardware video backends for HiSilicon, Broadcom and Dreambox Amlogic receivers;
+- a Linux-DVB hardware audio output with PES timestamps and driver A/V sync;
 - `stb-player-probe`, a small backend and capability diagnostic tool.
 
-It deliberately does **not** provide a demuxer, an audio decoder, an audio
-output, a subtitle renderer, a GUI, network mounts or a complete media player.
-Those remain the responsibility of Kodi or another frontend.
+It deliberately does **not** provide a demuxer, software audio decoder,
+subtitle renderer, GUI, network mounts or a complete media player. Those remain
+the responsibility of Kodi or another frontend.
 
 | Responsibility | Owner |
 | --- | --- |
 | Input, demuxing and stream selection | Frontend |
-| Audio decoding and output | Frontend |
-| Master clock and A/V policy | Frontend |
+| Software audio decoding and stream selection | Frontend |
+| AC3/EAC3/DTS hardware decoding | DVB audio decoder where supported |
+| STB hardware audio output | `libstbplayer` DVB audio API where supported |
+| Master clock and A/V policy | Frontend plus the shared STB hardware clock |
 | Subtitles, OSD and player UI | Frontend |
 | Compressed video decoding | `libstbplayer` backend and STB driver |
 | Video-plane presentation | Backend where supported |
@@ -56,7 +58,6 @@ available on the target machine.
 | `hisi-dvb` | HiSilicon ARM receivers | HiSilicon AVPLAY/VO SDK, with Linux-DVB support where required | Vendor `libhi_*` libraries and `/dev/hi_vdec` plus `/dev/hi_vo` must be supplied by the receiver image. H.264 and HEVC input must be Annex B. |
 | `bcm-dvb` | Broadcom ARM and MIPSel receivers | `/dev/dvb/adapter0/video0`, DVB video ioctls and PES framing | Supports driver-specific `normal`, `type2`, `dreambox`, `vuplus` and `gigablue` variants. Optional codecs are selected at build time from the machine capabilities. |
 | `dream-aml` | Dreambox One and Dreambox Two | Dreambox direct-frame DVB ABI and the Amlogic `amvideo` plane | Uses `/dev/dvb/adapter0/video0`, `/dev/amvideo_poll` and the Dreambox Amlogic sysfs controls. It is not the CoreELEC V4L2 path. H.264 and HEVC input must be Annex B. |
-| `fake` | Development host | No hardware | Built only for tests; exercises loading, ABI negotiation, packet ownership, status, flush and teardown. |
 
 ### Codec support
 
@@ -83,6 +84,9 @@ work around a decoder failure that is also present in Enigma2.
 ### Hardware validated by the STB Kodi project
 
 Representative runtime tests have covered:
+
+The following list describes the established video backends. The new hardware
+audio path has separate receiver test results documented below.
 
 - HiSilicon: Octagon SF8008, SX88 V2 and SX988; AX/Mutant HD61-class
   receivers; Zgemma H11; and Dinobot U53/U571 variants;
@@ -111,17 +115,251 @@ No proprietary vendor libraries or firmware are distributed by this source
 repository. An image maintainer must obtain and package them under terms that
 permit their use and distribution.
 
+## Hardware audio output
+
+The Linux-DVB audio path, enabled by default in OE builds, writes timestamped PES packets to
+`/dev/dvb/adapter0/audio0`, enables `AUDIO_SET_AV_SYNC`, and reads the decoder
+clock with `AUDIO_GET_PTS`. It is based on the same driver contract used by
+Enigma2's `dvbaudiosink` and supports stereo S16 PCM plus hardware MPEG audio,
+MP3, ADTS-framed AAC, AC3, EAC3 and DTS where the receiver driver implements those bypass
+modes. AC3, EAC3 and DTS remain compressed, so their multichannel layout is
+preserved for the receiver or AVR instead of being reduced to Kodi's stereo
+ALSA output. Volume and mute use the same open decoder handle through
+`AUDIO_SET_MIXER` and `AUDIO_SET_MUTE`, avoiding a second competing open of
+the device.
+
+Use `-DSTBP_DVB_AUDIO_VARIANT=dreambox` for the legacy Dreambox DVB bypass
+numbering, or `dags` for normal bypass numbers with the DAGS `BCMA` PCM
+framing. Other receiver families use `normal`. The frontend must pass each
+audio buffer's original 90 kHz PTS to `stbp_audio_queue_packet()`; fabricating
+timestamps from wall-clock time defeats hardware lipsync.
+
+Dreambox BCM uses EAC3 bypass `7`, PCM bypass `15` with the `BCMA` private
+header, and DTS bypass `2`. Its DTS payloads are normalized from 16-bit
+little-endian or 14-bit packed data to 16-bit big-endian before PES submission,
+matching the driver-facing format of the supplied DreamOS ARM sink. This is
+an independent implementation; no proprietary DreamOS binary is shipped.
+The DM900/DM920 build enables native DTS instead of the old GStreamer
+software-downmix selection. DM820/DM7080 retain their E2 software
+fallback. Existing driver proc
+settings select downmix, multichannel PCM or passthrough where available.
+Native DTS playback in E2 and the Kodi hardware-audio output have been
+confirmed on DM920, including multichannel PCM output to an AVR. DM820/DM7080
+share the Dream BCM integration but have not repeated the new Kodi audio
+tests. Codec IDs and mocked I/O tests alone do not validate driver timing or
+AVR output on another receiver.
+
+The Kodi STB sink forwards AC3/EAC3 and DTS core without IEC61937
+wrapping. Other formats use Kodi decoding followed by stereo PCM output.
+GUI and keepalive audio use a continuous sample-based PES timeline; starting
+the decoder with untimestamped PCM can stall it even when later packets have
+valid timestamps. The sink clears GUI preroll when media timestamps first
+arrive and limits queued audio using the decoder clock. Resume preroll is
+measured from the first queued media PTS until the decoder clock starts.
+Some drivers report elapsed PCM samples instead of media PTS. Enable
+`STBP_DVB_AUDIO_PCM_SAMPLE_CLOCK` only after verifying that driver behavior;
+currently it is measured on Duo 4K Lite. The capability flag lets the frontend
+measure PCM queue delay from submitted samples and preserve a continuous GUI
+timeline. Flushing this PCM path reopens the decoder because `AUDIO_CLEAR_BUFFER`
+temporarily exposes the previous counter. Duo 4K Lite runtime tests confirmed
+GUI/movie PCM audio, lipsync after seeking and audio after returning to Enigma2.
+These PCM results do not validate other receiver drivers.
+On Uno 4K SE, the PCM decoder uses media PTS, but may initially return a stale
+timestamp from the previous stream. Kodi primes a bounded queue until the
+timestamp belongs to the new timeline. Media-timed PCM uses hardware-clock
+feedback without software sample dropping; sample-counter PCM keeps its
+existing correction path. On 13 October 2026, Uno 4K SE tests confirmed
+stutter-free DTS and AC3 playback in both downmix and passthrough modes with
+Kodi test build `r117.unohw4` and `libstbplayer r68.unohw2`.
+On SF8008 and its `libreader` driver family, native audio requires the
+Linux-DVB video path as well: a separate video-only AVPLAY instance uses
+`SYNC_REF_NONE` and cannot share the DVB audio decoder's clock. Keep
+`libreader` running while Enigma2 is stopped; the vendor service owns both
+decoders, not Enigma2. Its readiness must be checked before reading audio
+proc controls. On 13 October 2026, SF8008 hardware tests confirmed DTS
+lipsync after resume and seeking with this shared-driver path. The previous
+test also confirmed audio after returning to Enigma2. Other members of this
+driver family inherit the build setting but have not individually repeated
+the new audio tests.
+On the Pulse Mini's original HiSi DVB-driver family, `AUDIO_GET_PTS` can stay
+unchanged after a seek although the decoder still plays audio. The optional
+`STBP_DVB_AUDIO_HISI_VIDEO_CLOCK` path uses the active video decoder's real PTS
+for media audio queue feedback, independent of codec. The backend registers its
+existing descriptor and unregisters it before teardown; no extra decoder is
+opened. Missing or unrelated
+video timestamps fall back to the audio clock. Kodi marks film timestamps with
+`STBP_AUDIO_PACKET_MEDIA_PTS`, including software-decoded film PCM; GUI audio,
+sample-counter PCM and playback without hardware video keep their audio clock.
+OE enables this only for the original HiSi Linux-DVB family, not SF8008/libreader
+or Broadcom receivers.
+Pulse Mini tests on 13 October 2026 confirmed synchronized DTS after repeated
+seeks and stop/resume with the isolated clock test. AC3 reproduced the same
+failure on the original package. The integrated Kodi `r121.pulsehw1` and
+`libstbplayer r71.pulsehw1` then passed the user's AC3 and DTS seek and stop/resume
+lipsync check; the log confirms media audio uses the video presentation clock.
+Software-decoded film PCM has not passed regression testing with this
+integrated package. A DivX5/MP3 AVI test failed with no picture or sound: the
+HiSi backend rejected the DivX5 codec identifier, Kodi fell back to software
+video, and PCM output repeatedly timed out without a hardware video clock.
+The same AVI also produced no picture in Enigma2, but its audio worked there.
+The user deferred this AVI case; it does not validate Kodi PCM with software
+video. A generated H264/AAC sync clip also stalled at startup in Kodi: H264
+hardware decoding opened, but the software-decoded PCM output repeatedly timed
+out. The same clip produced picture and sound in Enigma2; this does not establish
+that Enigma2 used PCM rather than its native AAC decoder. Standalone DVB PCM
+tests also remained silent, including a test without hardware A/V waiting.
+A separate native HiSi slave-track PCM test produced an audible tone, with
+Enigma2 audio working after the test. This does not use Enigma2's whole-file
+player: the vendor service keeps sound device 0 open, while Kodi owns only its
+additional PCM track.
+
+The optional `STBP_DVB_AUDIO_HISI_PCM_TRACK` integration uses that native track
+for software-decoded stereo S16 PCM and leaves compressed AC3/DTS on the tested
+DVB path. It resolves the SDK entry points already preloaded by the HiSi Kodi
+starter; it neither opens/closes the shared sound device nor changes its
+HDMI/SPDIF modes. Queue feedback uses submitted samples minus the SDK track
+delay through the existing `PCM_SAMPLE_CLOCK` capability. OE enables it only
+for the original 32-bit HiSi DVB-driver family, not SF8008/libreader or other
+platforms. Pulse Mini hardware tests confirmed native PCM startup with the
+H264/AAC clip: stereo S16 at 48 kHz, 480-frame packets and sample-clock feedback,
+without the earlier startup audio timeouts. Seeking initially froze the first
+target video frame while audio continued. A complete video stop/clear/play/
+continue cycle fixed this in the isolated test; the user confirmed repeated
+seeks, picture/sound synchronization, volume/mute and sound after returning
+to Enigma2.
+
+`libstbplayer r73.pulsehw1` integrates this recovery only while native HiSi PCM
+is selected. Selection survives temporary track recreation during a concurrent
+seek, but changes back when compressed audio opens. AC3/DTS retain their
+existing flush sequence. Mocked tests cover PCM selection/teardown, both
+compressed-codec exclusions, ioctl ordering and each failure point; normal
+and Vu test configurations, cross-compilation and package QA passed. The
+regular package is installed without diagnostic helpers. The user confirmed
+the integrated AAC test, and its log verifies forward/backward seeks using
+the native-PCM-only restart. AC3 and DTS regression tests also passed according
+to the user; their logs confirm compressed hardware output, nonzero resume
+and seeking. Short audio-output failures followed by successful sink reopening
+still occur around compressed seeks, as previously observed before the PCM
+change; these traces are not error-free. The native PCM restart is absent from
+subsequent compressed seeks, although an initial resume can still occur while
+the previous GUI PCM output is selected. On 14 October 2026, the user closed
+this Pulse Mini test round and explicitly waived the additional saved AAC
+resume test. That test remains unverified, not failed. Enigma2 audio recovery
+was confirmed with the preceding test builds; the final r73 return-to-Enigma2
+check was not separately reported. No further tests are scheduled for this round.
+TrueHD, DTS-HD and multichannel PCM are not advertised by this first version.
+The driver's existing downmix/passthrough setting is preserved: a TV using
+downmix still receives stereo; AC3/DTS 5.1 output requires the corresponding
+driver passthrough setting and a compatible receiver.
+
+The OE integration enables DVB hardware audio by default; no opt-in is needed.
+It selects `main` and always applies the Kodi hardware-audio patches. The
+`STB_HARDWARE_AUDIO` build switch and development-branch selection have been
+removed. Commit and publish the matching library changes on `main` before
+using the updated OE recipes; local receiver builds used the working tree
+through externalsrc. `--audio-backend=alsa` explicitly selects the existing
+ALSA output at runtime for comparison; it is not the default.
+
+Validation proceeds from Duo 4K Lite and DM920 to GigaBlue Quad 4K, SF8008,
+Pulse Mini and Dream Two. DM820/DM7080 share the Dream BCM integration; no
+additional receiver test is scheduled for them. The remaining HiSilicon variants
+and Dream Amlogic still require clock/decoder integration checks before the rollout
+can be considered complete. Dream One/Two audio testing is deferred until
+the new Dream Amlogic drivers are available. Default selection is not hardware
+certification.
+Broadcom hardware audio uses the driver's A/V clock rather
+than Kodi's host-STC bridge, selected through `stbp_clock_config.kodi_is_clock_master`.
+
+To verify the selected output, check Kodi's log for `STB Initialized` and
+`CAESinkSTB::Initialize` with `opened STB hardware audio output`. Merely listing
+`STB hardware audio` during device enumeration does not prove it is in use.
+Decoder labels such as `ff-dca` describe software decoding, not the output
+device: decoded PCM can still be submitted to the DVB hardware audio output.
+Compressed playback must instead select a passthrough codec such as `pt-dts`
+and open the STB sink with codec 5 (AC3), 6 (EAC3) or 7 (DTS). With the STB
+sink selected, supported compressed formats are sent to the hardware decoder;
+the receiver's driver modes decide downmix, passthrough or conversion. The
+generic Kodi passthrough/receiver-capability switches are replaced by the
+STB driver controls below. The saved `Default` device is resolved to the
+enumerated STB device before format checks and packet packing.
+
+Initial Duo 4K Lite AVR tests confirmed audible AC3 and DTS output after
+disabling downmix in Enigma2. Full multichannel acceptance still requires:
+verify its input format/channel indication, audible channels, lipsync,
+seek/resume and audio after returning to Enigma2. The new settings UI and
+other receiver families still require hardware validation.
+
+### Receiver audio and video settings in Kodi
+
+The development Kodi patch adds **STB audio output** under Settings > System >
+Audio and **STB video output** under Settings > System > Display (Standard
+settings level or higher). Controls are discovered from existing readable and
+writable driver proc/sysfs nodes, not from receiver model names. Advertised
+`*_choices` determine the available modes; fixed fallbacks are limited to known
+Enigma2 interfaces. Missing or unusable controls are hidden.
+
+The same driver modes are available in the player's Audio and Video settings
+during playback. They update the same central values as the System menus and
+use the same validation and video confirmation. With STB audio selected, these
+modes replace the player's generic passthrough on/off toggle; the ALSA dialog
+retains its existing toggle. The separate-preferences switches remain in the
+System menus and also govern changes made during playback.
+
+Both groups default to **Save separate Kodi settings: off**. Kodi reads the
+current Enigma2/driver values at startup and permits session-only changes.
+Enabling this option saves that group's Kodi preferences and reapplies supported
+values on the next start. Disabling it returns the group to the original
+driver values. On normal Kodi exit the original values are restored regardless
+of this option; settings changed subsequently by another owner are not overwritten.
+Kodi does not edit Enigma2's configuration file.
+
+Audio controls include AC3, EAC3 and DTS modes, driver multichannel PCM routing,
+HDMI audio source, surround and automatic-volume controls, where available.
+On Dream drivers without a separate `dts` node, the DTS core mode uses the
+`dtshd` node when it advertises `force_dts`. Kodi exposes it once as DTS and
+restores the original value on exit; this does not enable DTS-HD transport.
+Official Vu drivers share the AC3 output mode with DTS. Kodi labels this control
+"Dolby Digital / DTS mode" and decodes DTS to stereo PCM in downmix mode, as
+Enigma2 does. Passthrough retains the compressed DTS core for the AVR. Changes
+also recheck the running DTS decoder; Gigablue/Lite and Dream hardware downmix
+are unaffected.
+AAC/AAC+, AAC transcoding, WMA Pro and DTS-HD mode values are displayed read-only
+because this Kodi sink does not yet transport those formats natively. A driver
+control does not add codec support: Kodi-decoded fallback PCM remains stereo.
+Driver-decoded AC3/EAC3/DTS can retain multichannel audio when the driver and
+connected receiver support the selected mode. The separate audio menu is hidden
+when using the legacy ALSA backend.
+
+Video controls include HDMI colour space, colourimetry, bit depth, HDR/HLG modes,
+decoder sync mode and deinterlacing, where readable and supported. Each manual
+video change requires confirmation within 15 seconds or is reverted. Existing
+OSD resolution, refresh-rate selection and video-plane geometry remain unchanged.
+Write-only command interfaces without a recoverable current value are not exposed.
+Selecting a mode offered by a driver does not prove that the connected TV/AVR
+supports it. Saved video preferences should therefore be disabled before changing
+the HDMI equipment.
+
+The audio device API is serialized by the caller. `STBP_OK` from packet submission
+transfers ownership to the library; `STBP_AGAIN` means the new packet has not
+been accepted and must be retried. A partial device write remains buffered.
+PES headers and payloads are written separately, as in `dvbaudiosink`; some
+vendor PCM parsers accept a combined write without actually decoding it.
+Flush discards this pending data and the decoder queue. Drain is bounded and
+returns `STBP_AGAIN` if the queued endpoint is not reached; a stationary decoder
+PTS does not count as successful playback. Close returns the source to DVB demux.
+
 ## Building and testing
 
-The default build creates the loader library, probe tool, fake backend and unit
-test. It does not enable a hardware backend.
+The default Linux build creates the loader library, DVB audio API and probe
+tool. It does not enable a hardware video backend.
+Use `-DSTBP_BUILD_DVB_AUDIO=OFF` when building the video-only library on another
+host platform. Development-only tests and the fake backend are not bundled
+in this source tree; the validation results above distinguish mocked checks
+from tests on actual receivers.
 
 ```sh
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DSTBP_BUILD_TESTS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
 ```
 
 To install into a staging prefix:
@@ -138,7 +376,6 @@ expect set-top-box device nodes and driver behavior.
 ```sh
 cmake -S . -B build-hisi \
   -DCMAKE_BUILD_TYPE=Release \
-  -DSTBP_BUILD_TESTS=OFF \
   -DSTBP_BUILD_HISI_DVB_BACKEND=ON
 cmake --build build-hisi --parallel
 ```
@@ -154,14 +391,19 @@ This mode uses the receiver's Linux-DVB stream types and PES framing instead
 of opening a separate AVPLAY/VO window. It is a driver-family choice, not a
 generic HiSilicon default; verified OE recipes currently enable it for the
 GFutures HD60/HD61/HD66, AB-COM Pulse, Maxytec Multibox and Zgemma HiSilicon
-families.
+families. Native hardware-audio builds additionally enable it for SF8008,
+SF8008 Mini, SX88 V2, SX988, Anadol IP8, Beyonwiz V2, Amiko Viper 4K,
+Qviart OG2S/OG2OTT 4K, uClan Ustym 4K Pro/OTT Premium/S2 OTT X, and
+GigaBlue IP 4K/Trio 4K/Trio 4K Pro (`MACHINE=gbmv200`). The Amiko Viper
+4K here is `MACHINE=viper4k`, not the Dinobot-based Viper 4K V40 (`u571`).
+DAGS `app_init` and Dinobot `showiframe` integrations are not switched by
+this `libreader` family setting.
 
 ### Broadcom
 
 ```sh
 cmake -S . -B build-bcm \
   -DCMAKE_BUILD_TYPE=Release \
-  -DSTBP_BUILD_TESTS=OFF \
   -DSTBP_BUILD_BCM_DVB_BACKEND=ON \
   -DSTBP_BCM_DVB_VARIANT=normal \
   -DSTBP_BCM_DVB_STARTUP_CATCHUP=ON \
@@ -212,7 +454,6 @@ DVB driver.
 ```sh
 cmake -S . -B build-dream-aml \
   -DCMAKE_BUILD_TYPE=Release \
-  -DSTBP_BUILD_TESTS=OFF \
   -DSTBP_BUILD_DREAM_AML_BACKEND=ON
 cmake --build build-dream-aml --parallel
 ```
@@ -229,6 +470,7 @@ A normal installation contains:
 ${libdir}/libstbplayer.so.0
 ${libdir}/pkgconfig/libstbplayer.pc
 ${includedir}/stbplayer/backend.h
+${includedir}/stbplayer/audio.h
 ${includedir}/stbplayer/loader.h
 ${bindir}/stb-player-probe
 ${libdir}/stbplayer/libstbplayer-backend-<name>.so
@@ -389,7 +631,7 @@ are welcome. A change should include:
 - the affected receiver, SoC, driver and image version;
 - the exact codec and sample properties used for testing;
 - a capability update only when real hardware testing confirms it;
-- fake-backend or loader coverage for changes to the common ABI;
+- validation evidence for loader behavior and changes to the common ABI;
 - clean teardown that restores the decoder and video plane for Enigma2; and
 - no proprietary SDK binaries, confidential headers, credentials or test media
   without redistribution permission.

@@ -115,6 +115,7 @@ struct bcm_instance
   int64_t last_pts_90k;
   int stc_host_enabled;
   int stc_needs_seed;
+  int kodi_is_clock_master;
 #if defined(STBP_BCM_DVB_VARIANT_DREAMBOX)
   int decoder_has_data;
   int resume_startup_pending;
@@ -255,6 +256,8 @@ static void close_nexus_host_stc(struct bcm_instance* instance)
 
 static int host_stc_available(const struct bcm_instance* instance)
 {
+  if (!instance->kodi_is_clock_master)
+    return 0;
   if (access(BCM_STC_HOST_DEVICE, W_OK) == 0)
     return 1;
 #if STBP_BCM_DVB_NEXUS_STC
@@ -1120,7 +1123,6 @@ static enum stbp_result bcm_open(void* opaque,
   struct bcm_instance* instance = (struct bcm_instance*)opaque;
   enum stbp_result final_result = STBP_ERROR_BACKEND;
   int stream_type;
-  (void)clock;
 
   if (instance == NULL || stream == NULL || stream->struct_size < sizeof(*stream) ||
       (clock != NULL && clock->struct_size < sizeof(*clock)) ||
@@ -1154,8 +1156,13 @@ static enum stbp_result bcm_open(void* opaque,
   if (!configure_codec_data(instance, stream))
     goto failed;
 
+  instance->kodi_is_clock_master = clock == NULL || clock->kodi_is_clock_master;
+  if (!instance->kodi_is_clock_master)
+    bcm_log(instance, STBP_LOG_INFO, "Broadcom video uses the DVB hardware audio clock");
+
 #if STBP_BCM_DVB_NEXUS_STC
-  if (access(BCM_STC_HOST_DEVICE, W_OK) != 0 && !open_nexus_host_stc(instance))
+  if (instance->kodi_is_clock_master && access(BCM_STC_HOST_DEVICE, W_OK) != 0 &&
+      !open_nexus_host_stc(instance))
     bcm_log(instance, STBP_LOG_WARNING, "Broadcom Nexus host STC is unavailable");
 #endif
 
@@ -1225,7 +1232,7 @@ static enum stbp_result bcm_open(void* opaque,
   instance->decoder_has_data = 0;
   instance->resume_startup_pending = 0;
 #endif
-  instance->startup_preroll = 1;
+  instance->startup_preroll = instance->kodi_is_clock_master;
   instance->startup_preroll_packets = 0U;
   instance->startup_preroll_first_pts_90k = STBP_PTS_NONE;
   instance->startup_preroll_last_pts_90k = STBP_PTS_NONE;

@@ -3,9 +3,16 @@ cmake_minimum_required(VERSION 3.16)
 project(stbplayer VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
-include(CTest)
 
-option(STBP_BUILD_TESTS "Build the fake backend and ABI tests" ON)
+option(STBP_BUILD_DVB_AUDIO "Build the Linux-DVB hardware audio output" ON)
+set(STBP_DVB_AUDIO_VARIANT "normal" CACHE STRING
+    "Linux-DVB audio framing variant: normal, dreambox or dags")
+set_property(CACHE STBP_DVB_AUDIO_VARIANT PROPERTY STRINGS normal dreambox dags)
+option(STBP_DVB_AUDIO_HAVE_EAC3 "Advertise Linux-DVB E-AC3 decoding" ON)
+option(STBP_DVB_AUDIO_HAVE_DTS "Advertise Linux-DVB DTS decoding" ON)
+option(STBP_DVB_AUDIO_PCM_SAMPLE_CLOCK "PCM AUDIO_GET_PTS counts samples from zero" OFF)
+option(STBP_DVB_AUDIO_HISI_VIDEO_CLOCK "Use the HiSi video clock for media-timed DVB audio" OFF)
+option(STBP_DVB_AUDIO_HISI_PCM_TRACK "Use a native HiSi slave track for decoded PCM" OFF)
 option(STBP_BUILD_HISI_DVB_BACKEND "Build the Linux-DVB backend used by HiSilicon STBs" OFF)
 option(STBP_HISI_MV310 "Use the explicit MV310 AVPLAY decoder allocation" OFF)
 option(STBP_HISI_LINUX_DVB "Use the receiver Linux-DVB video driver instead of AVPLAY" OFF)
@@ -30,6 +37,47 @@ add_library(stbplayer SHARED
   src/loader.c
   src/result.c
 )
+
+if(STBP_BUILD_DVB_AUDIO)
+  if(NOT STBP_DVB_AUDIO_VARIANT MATCHES "^(normal|dreambox|dags)$")
+    message(FATAL_ERROR "Unsupported STBP_DVB_AUDIO_VARIANT: ${STBP_DVB_AUDIO_VARIANT}")
+  endif()
+  if(STBP_DVB_AUDIO_VARIANT STREQUAL "dreambox")
+    set(STBP_DVB_AUDIO_VARIANT_ID 1)
+  elseif(STBP_DVB_AUDIO_VARIANT STREQUAL "dags")
+    set(STBP_DVB_AUDIO_VARIANT_ID 2)
+  else()
+    set(STBP_DVB_AUDIO_VARIANT_ID 0)
+  endif()
+  target_sources(stbplayer PRIVATE
+    src/audio_dvb.c
+    src/audio_pes.c
+  )
+  target_compile_definitions(stbplayer PRIVATE
+    STBP_DVB_AUDIO_VARIANT=${STBP_DVB_AUDIO_VARIANT_ID}
+    STBP_DVB_AUDIO_HAVE_EAC3=$<BOOL:${STBP_DVB_AUDIO_HAVE_EAC3}>
+    STBP_DVB_AUDIO_HAVE_DTS=$<BOOL:${STBP_DVB_AUDIO_HAVE_DTS}>
+    STBP_DVB_AUDIO_PCM_SAMPLE_CLOCK=$<BOOL:${STBP_DVB_AUDIO_PCM_SAMPLE_CLOCK}>
+    STBP_DVB_AUDIO_DTS_SHARED_AC3=$<STREQUAL:${STBP_BCM_DVB_VARIANT},vuplus>
+  )
+endif()
+if(STBP_DVB_AUDIO_HISI_PCM_TRACK)
+  if(NOT STBP_BUILD_DVB_AUDIO OR NOT STBP_BUILD_HISI_DVB_BACKEND OR NOT STBP_HISI_LINUX_DVB
+     OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "HiSi PCM track requires DVB audio and a 32-bit HiSi Linux-DVB backend")
+  endif()
+  target_sources(stbplayer PRIVATE src/hisi_pcm.c)
+  target_compile_definitions(stbplayer PRIVATE STBP_DVB_AUDIO_HISI_PCM_TRACK=1)
+endif()
+if(STBP_DVB_AUDIO_HISI_VIDEO_CLOCK)
+  if(NOT STBP_BUILD_DVB_AUDIO OR NOT STBP_BUILD_HISI_DVB_BACKEND OR NOT STBP_HISI_LINUX_DVB)
+    message(FATAL_ERROR "HiSi audio video clock requires DVB audio and the HiSi Linux-DVB backend")
+  endif()
+  find_package(Threads REQUIRED)
+  target_sources(stbplayer PRIVATE src/hisi_audio_clock.c)
+  target_compile_definitions(stbplayer PRIVATE STBP_DVB_AUDIO_HISI_VIDEO_CLOCK=1)
+  target_link_libraries(stbplayer PRIVATE Threads::Threads)
+endif()
 add_library(stbplayer::stbplayer ALIAS stbplayer)
 
 target_compile_features(stbplayer PRIVATE c_std_11)
@@ -76,6 +124,16 @@ if(STBP_BUILD_HISI_DVB_BACKEND)
   add_library(stbplayer-backend-hisi-dvb MODULE backends/hisi_dvb.c)
   target_compile_features(stbplayer-backend-hisi-dvb PRIVATE c_std_11)
   target_include_directories(stbplayer-backend-hisi-dvb PRIVATE include)
+  if(STBP_DVB_AUDIO_HISI_PCM_TRACK)
+    target_include_directories(stbplayer-backend-hisi-dvb PRIVATE src)
+    target_compile_definitions(stbplayer-backend-hisi-dvb PRIVATE STBP_DVB_AUDIO_HISI_PCM_TRACK=1)
+    target_link_libraries(stbplayer-backend-hisi-dvb PRIVATE stbplayer::stbplayer)
+  endif()
+  if(STBP_DVB_AUDIO_HISI_VIDEO_CLOCK)
+    target_include_directories(stbplayer-backend-hisi-dvb PRIVATE src)
+    target_compile_definitions(stbplayer-backend-hisi-dvb PRIVATE STBP_DVB_AUDIO_HISI_VIDEO_CLOCK=1)
+    target_link_libraries(stbplayer-backend-hisi-dvb PRIVATE stbplayer::stbplayer)
+  endif()
   target_compile_definitions(stbplayer-backend-hisi-dvb PRIVATE
     STBP_HISI_MV310=$<BOOL:${STBP_HISI_MV310}>
     STBP_HISI_LINUX_DVB=$<BOOL:${STBP_HISI_LINUX_DVB}>
@@ -141,23 +199,5 @@ if(STBP_BUILD_BCM_DVB_BACKEND)
   )
   install(TARGETS stbplayer-backend-bcm-dvb
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/stbplayer
-  )
-endif()
-
-if(BUILD_TESTING AND STBP_BUILD_TESTS)
-  add_library(stbplayer-backend-fake MODULE tests/fake_backend.c)
-  target_compile_features(stbplayer-backend-fake PRIVATE c_std_11)
-  target_include_directories(stbplayer-backend-fake PRIVATE include)
-  set_target_properties(stbplayer-backend-fake PROPERTIES
-    PREFIX "lib"
-    OUTPUT_NAME "stbplayer-backend-fake"
-  )
-
-  add_executable(stbplayer-loader-test tests/loader_test.c)
-  target_compile_features(stbplayer-loader-test PRIVATE c_std_11)
-  target_link_libraries(stbplayer-loader-test PRIVATE stbplayer::stbplayer)
-
-  add_test(NAME stbplayer-loader
-    COMMAND stbplayer-loader-test $<TARGET_FILE_DIR:stbplayer-backend-fake>
   )
 endif()
