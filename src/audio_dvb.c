@@ -403,7 +403,10 @@ static int64_t audio_presentation_pts(struct stbp_audio_device* device)
       /* Do not use a video PTS left on the old timeline during a seek. */
       if (distance >= -900000 && distance <= 900000)
       {
-        result = video_pts;
+        /* After seek the video clock can lead all queued audio. Report only
+         * through the queued end so the sink can start its clock and refill,
+         * instead of repeatedly reopening an apparently full audio queue. */
+        result = distance > 0 ? device->status.queued_end_pts_90k : video_pts;
         if (!device->video_clock_logged)
         {
           audio_log(device, STBP_LOG_INFO, "HiSilicon media audio uses video presentation clock");
