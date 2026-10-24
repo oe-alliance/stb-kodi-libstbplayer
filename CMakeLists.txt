@@ -62,10 +62,12 @@ if(STBP_BUILD_DVB_AUDIO)
   )
 endif()
 if(STBP_DVB_AUDIO_HISI_PCM_TRACK)
-  if(NOT STBP_BUILD_DVB_AUDIO OR NOT STBP_BUILD_HISI_DVB_BACKEND OR NOT STBP_HISI_LINUX_DVB
+  if(NOT STBP_BUILD_DVB_AUDIO OR NOT STBP_BUILD_HISI_DVB_BACKEND
      OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
-    message(FATAL_ERROR "HiSi PCM track requires DVB audio and a 32-bit HiSi Linux-DVB backend")
+    message(FATAL_ERROR "HiSi PCM track requires DVB audio and a 32-bit HiSi backend")
   endif()
+  # The SDK sound track is independent of the Linux-DVB or AVPLAY video path.
+  # Do not switch Dinobot/DAGS video drivers just to enable native PCM audio.
   target_sources(stbplayer PRIVATE src/hisi_pcm.c)
   target_compile_definitions(stbplayer PRIVATE STBP_DVB_AUDIO_HISI_PCM_TRACK=1)
 endif()

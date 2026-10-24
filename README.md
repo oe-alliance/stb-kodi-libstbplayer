@@ -218,9 +218,10 @@ for software-decoded stereo S16 PCM and leaves compressed AC3/DTS on the tested
 DVB path. It resolves the SDK entry points already preloaded by the HiSi Kodi
 starter; it neither opens/closes the shared sound device nor changes its
 HDMI/SPDIF modes. Queue feedback uses submitted samples minus the SDK track
-delay through the existing `PCM_SAMPLE_CLOCK` capability. OE enables it only
-for the original 32-bit HiSi DVB-driver family, not SF8008/libreader or other
-platforms. Pulse Mini hardware tests confirmed native PCM startup with the
+delay through the existing `PCM_SAMPLE_CLOCK` capability. This audio option
+works independently of the Linux-DVB or AVPLAY video selection; it requires
+a 32-bit HiSi build and the vendor sound device to remain initialized.
+Pulse Mini hardware tests confirmed native PCM startup with the
 H264/AAC clip: stereo S16 at 48 kHz, 480-frame packets and sample-clock feedback,
 without the earlier startup audio timeouts. Seeking initially froze the first
 target video frame while audio continued. A complete video stop/clear/play/
@@ -247,6 +248,22 @@ this Pulse Mini test round and explicitly waived the additional saved AAC
 resume test. That test remains unverified, not failed. Enigma2 audio recovery
 was confirmed with the preceding test builds; the final r73 return-to-Enigma2
 check was not separately reported. No further tests are scheduled for this round.
+
+On 24 October 2026, SF8008 tests with `r74.sfpcm1` also confirmed improved
+H.264/AAC MP4 startup and forward/backward seeks. The previous DVB PCM path
+reset the shared libreader A/V instance when reopening audio, potentially
+discarding already-submitted video. The native PCM track avoids those audio
+resets. The user also confirmed AC3 and DTS playback with driver downmix;
+these still use the compressed DVB decoder, not software PCM. A separate
+Elysium 4K late-picture report is unresolved and was deferred by the user.
+
+OE `r75` enables native PCM for the existing Linux-DVB families, the
+SF8008/libreader family, DAGS Dual (`dagsmv200`) and Kodi-capable Dinobot
+`u5*` receivers. The DAGS/Dinobot AVPLAY video paths and display-owner
+processes are retained, as is each family's compressed-audio clock choice.
+DAGS/Dinobot have not yet repeated the native PCM hardware tests; build
+coverage must not be treated as confirmation of playback on those boxes.
+
 TrueHD, DTS-HD and multichannel PCM are not advertised by this first version.
 The driver's existing downmix/passthrough setting is preserved: a TV using
 downmix still receives stereo; AC3/DTS 5.1 output requires the corresponding
@@ -398,6 +415,12 @@ GigaBlue IP 4K/Trio 4K/Trio 4K Pro (`MACHINE=gbmv200`). The Amiko Viper
 4K here is `MACHINE=viper4k`, not the Dinobot-based Viper 4K V40 (`u571`).
 DAGS `app_init` and Dinobot `showiframe` integrations are not switched by
 this `libreader` family setting.
+
+`-DSTBP_DVB_AUDIO_HISI_PCM_TRACK=ON` selects a separate native sound track
+for decoded PCM on either video path. It does not require or enable
+`STBP_HISI_LINUX_DVB`, and it does not select
+`STBP_DVB_AUDIO_HISI_VIDEO_CLOCK`. Keep the latter restricted to drivers
+whose compressed-audio PTS feedback requires that workaround.
 
 ### Broadcom
 

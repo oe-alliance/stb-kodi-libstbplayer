@@ -1215,7 +1215,7 @@ static enum stbp_result hisi_open(void* opaque,
                  "HI_UNF_AVPLAY_Create");
   instance->avplay_created = 1;
 
-  /* Kodi owns audio separately through ALSA, so AVPLAY must not wait for an
+  /* Kodi owns audio separately, so AVPLAY must not wait for an
    * audio or PCR clock that does not exist inside this video-only instance. */
   memset(&sync_attr, 0, sizeof(sync_attr));
   HISI_OPEN_CALL(HI_UNF_AVPLAY_GetAttr(instance->avplay, HI_UNF_AVPLAY_ATTR_ID_SYNC,
